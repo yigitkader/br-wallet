@@ -69,8 +69,8 @@ pub fn start_cracking(dict_path: &str, comparer: &Comparer) {
 
         // Hız için batch güncelleme
         let c = local_counter.fetch_add(1, Ordering::Relaxed);
-        if c % 10_000 == 0 {
-            pb.inc(10_000);
+        if c % 100_000 == 0 {
+            pb.inc(100_000);
         }
     });
 
