@@ -1,20 +1,19 @@
-use crate::brainwallet::BrainWallet;
+use crate::brainwallet::MultiWallet;
 use crate::comparer::Comparer;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use memmap2::Mmap;
 use rayon::prelude::*;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex,
 };
 
-pub fn start_cracking(dict_path: &str, comparer: &Comparer) {
-    let file = File::open(dict_path).expect("Dict not found");
-    let mmap = unsafe { Mmap::map(&file).expect("Mmap error") };
-
-    let found_file = Mutex::new(
+pub fn start_cracking(dict: &str, comparer: &Comparer) {
+    let file = std::fs::File::open(dict).expect("Dict missing");
+    let mmap = unsafe { Mmap::map(&file).unwrap() };
+    let log = Mutex::new(
         OpenOptions::new()
             .append(true)
             .create(true)
@@ -22,35 +21,45 @@ pub fn start_cracking(dict_path: &str, comparer: &Comparer) {
             .unwrap(),
     );
 
-    let total_lines = mmap.par_split(|&b| b == b'\n').count() as u64;
-    let pb = ProgressBar::new(total_lines);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec} checks/s)")
-        .unwrap());
-
-    let local_counter = AtomicU64::new(0);
+    let pb = ProgressBar::new(mmap.par_split(|&b| b == b'\n').count() as u64);
+    let counter = AtomicU64::new(0);
 
     mmap.par_split(|&b| b == b'\n').for_each(|line| {
         if line.is_empty() {
             return;
         }
 
-        let wallet = BrainWallet::fast_generate(line);
-        let found = comparer.is_match_20b(&wallet.h160_c)
-            || comparer.is_match_20b(&wallet.h160_u)
-            || comparer.is_match_20b(&wallet.h160_nested)
-            || comparer.is_match_32b(&wallet.taproot);
+        let w =
+            MultiWallet::generate_active(line, comparer.btc_on, comparer.eth_on, comparer.sol_on);
+        let pass = String::from_utf8_lossy(line);
+        let mut rep = String::new();
 
-        if found {
-            let report = wallet.get_report(&String::from_utf8_lossy(line));
-            if let Ok(mut f) = found_file.lock() {
-                let _ = f.write_all(report.as_bytes());
+        if let Some(btc) = w.btc {
+            if comparer.btc_20.contains(&btc.h160_c)
+                || comparer.btc_20.contains(&btc.h160_nested)
+                || comparer.btc_32.contains(&btc.taproot)
+            {
+                rep.push_str(&btc.get_report(&pass));
             }
-            pb.println(format!("\n{}", report));
+        }
+        if let Some(eth) = w.eth {
+            if comparer.eth_20.contains(&eth.address) {
+                rep.push_str(&eth.get_report(&pass));
+            }
+        }
+        if let Some(sol) = w.sol {
+            if comparer.sol_32.contains(&sol.address) {
+                rep.push_str(&sol.get_report(&pass));
+            }
         }
 
-        let c = local_counter.fetch_add(1, Ordering::Relaxed);
-        if c % 10_000 == 0 {
+        if !rep.is_empty() {
+            let mut f = log.lock().unwrap();
+            let _ = f.write_all(rep.as_bytes());
+            pb.println(format!("\n{}", rep));
+        }
+
+        if counter.fetch_add(1, Ordering::Relaxed) % 10_000 == 0 {
             pb.inc(10_000);
         }
     });

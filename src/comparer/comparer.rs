@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Write};
-use std::path::Path;
 
 #[derive(Deserialize, Serialize)]
 struct TargetFile {
@@ -10,77 +9,83 @@ struct TargetFile {
 }
 
 pub struct Comparer {
-    pub targets_20b: HashSet<[u8; 20]>,
-    pub targets_32b: HashSet<[u8; 32]>,
+    pub btc_20: HashSet<[u8; 20]>,
+    pub btc_32: HashSet<[u8; 32]>,
+    pub eth_20: HashSet<[u8; 20]>,
+    pub sol_32: HashSet<[u8; 32]>,
+    pub btc_on: bool,
+    pub eth_on: bool,
+    pub sol_on: bool,
 }
 
 impl Comparer {
-    pub fn load(json_path: &str, bin_path: &str) -> Self {
-        if Path::new(bin_path).exists() {
-            let file = File::open(bin_path).expect("Cache error");
-            let (t20, t32): (HashSet<[u8; 20]>, HashSet<[u8; 32]>) =
-                bincode::deserialize_from(BufReader::new(file)).expect("Cache parse error");
-            println!(
-                "Targets loaded from cache: 20b: {}, 32b: {}",
-                t20.len(),
-                t32.len()
-            );
-            return Comparer {
-                targets_20b: t20,
-                targets_32b: t32,
-            };
-        }
-
-        println!("Decoding targets from JSON...");
-        let file = File::open(json_path).expect("JSON not found");
-        let data: TargetFile = serde_json::from_reader(BufReader::new(file)).expect("JSON error");
-
-        let mut t20 = HashSet::with_capacity(data.addresses.len());
-        let mut t32 = HashSet::with_capacity(1_000_000);
-
-        for addr in data.addresses {
-            if addr.starts_with("bc1") {
-                // Native SegWit / Taproot
-                if let Ok((_hrp, _ver, prog)) = bech32::segwit::decode(&addr) {
-                    if prog.len() == 20 {
-                        let mut h = [0u8; 20];
-                        h.copy_from_slice(&prog);
-                        t20.insert(h);
-                    } else if prog.len() == 32 {
-                        let mut h = [0u8; 32];
-                        h.copy_from_slice(&prog);
-                        t32.insert(h);
-                    }
-                }
-            } else {
-                // Legacy / Nested
-                if let Ok(decoded) = bs58::decode(&addr).with_check(None).into_vec() {
-                    if decoded.len() >= 21 {
-                        let mut h = [0u8; 20];
-                        h.copy_from_slice(&decoded[1..21]);
-                        t20.insert(h);
-                    }
-                }
-            }
-        }
-
-        let mut bin_file = File::create(bin_path).expect("Cache create failed");
-        let encoded = bincode::serialize(&(&t20, &t32)).expect("Serialization failed");
-        bin_file.write_all(&encoded).expect("Write failed");
+    pub fn load() -> Self {
+        let (btc_20, btc_32) = Self::load_net("bitcoin", "btc.bin");
+        let (eth_20, _) = Self::load_net("ethereum", "eth.bin");
+        let (_, sol_32) = Self::load_net("solana", "sol.bin");
 
         Comparer {
-            targets_20b: t20,
-            targets_32b: t32,
+            btc_on: !btc_20.is_empty() || !btc_32.is_empty(),
+            eth_on: !eth_20.is_empty(),
+            sol_on: !sol_32.is_empty(),
+            btc_20,
+            btc_32,
+            eth_20,
+            sol_32,
         }
     }
 
-    #[inline(always)]
-    pub fn is_match_20b(&self, h: &[u8; 20]) -> bool {
-        self.targets_20b.contains(h)
-    }
+    fn load_net(name: &str, bin: &str) -> (HashSet<[u8; 20]>, HashSet<[u8; 32]>) {
+        let mut h20 = HashSet::new();
+        let mut h32 = HashSet::new();
 
-    #[inline(always)]
-    pub fn is_match_32b(&self, h: &[u8; 32]) -> bool {
-        self.targets_32b.contains(h)
+        if std::path::Path::new(bin).exists() {
+            let f = File::open(bin).unwrap();
+            return bincode::deserialize_from(BufReader::new(f)).unwrap();
+        }
+
+        let json = format!("{}_targets.json", name);
+        if let Ok(f) = File::open(&json) {
+            let data: TargetFile = serde_json::from_reader(BufReader::new(f)).unwrap();
+            for a in data.addresses {
+                match name {
+                    "bitcoin" => {
+                        if a.starts_with("bc1") {
+                            if let Ok((_, _, p)) = bech32::segwit::decode(&a) {
+                                if p.len() == 20 {
+                                    h20.insert(p.try_into().unwrap());
+                                } else {
+                                    h32.insert(p.try_into().unwrap());
+                                }
+                            }
+                        } else if let Ok(d) = bs58::decode(&a).with_check(None).into_vec() {
+                            if d.len() >= 21 {
+                                h20.insert(d[1..21].try_into().unwrap());
+                            }
+                        }
+                    }
+                    "ethereum" => {
+                        if let Ok(b) = hex::decode(a.trim_start_matches("0x")) {
+                            if b.len() == 20 {
+                                h20.insert(b.try_into().unwrap());
+                            }
+                        }
+                    }
+                    "solana" => {
+                        if let Ok(b) = bs58::decode(&a).into_vec() {
+                            if b.len() == 32 {
+                                h32.insert(b.try_into().unwrap());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !h20.is_empty() || !h32.is_empty() {
+                let mut cache = File::create(bin).unwrap();
+                bincode::serialize_into(cache, &(&h20, &h32)).unwrap();
+            }
+        }
+        (h20, h32)
     }
 }
