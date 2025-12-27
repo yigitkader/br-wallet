@@ -3,14 +3,26 @@ use crate::comparer::Comparer;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use rayon::prelude::*;
-use std::fs::File;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
+};
 
 pub fn start_cracking(dict_path: &str, comparer: &Comparer) {
     let file = File::open(dict_path).expect("Dictionary not found");
     let mmap = unsafe { Mmap::map(&file).expect("Mmap failed") };
 
-    // Satır sayısını say ve Progress Bar'ı ayarla
+    // Log dosyasını güvenli modda aç (Yoksa oluştur, varsa sonuna ekle)
+    let found_file = Mutex::new(
+        OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open("found.txt")
+            .expect("Could not open found.txt"),
+    );
+
     let total_lines = mmap.par_split(|&b| b == b'\n').count() as u64;
     let pb = ProgressBar::new(total_lines);
     pb.set_style(ProgressStyle::default_bar()
@@ -20,47 +32,42 @@ pub fn start_cracking(dict_path: &str, comparer: &Comparer) {
 
     let local_counter = AtomicU64::new(0);
 
+    println!("Scan started. Successes will be logged to found.txt");
+
     mmap.par_split(|&b| b == b'\n').for_each(|line| {
         if line.is_empty() {
             return;
         }
 
-        // Şifreden 4 farklı hash tipini üret
         let wallet = BrainWallet::fast_generate(line);
+        let pass_str = String::from_utf8_lossy(line);
+        let mut match_type = "";
 
-        // 1 & 3. Legacy (Comp) ve Native SegWit (bc1q)
+        // Eşleşme Kontrolleri
         if comparer.is_match_20b(&wallet.h160_c) {
-            pb.println(format!(
-                "\nMATCH! (1... / bc1q...) Pass: {:?}",
-                String::from_utf8_lossy(line)
-            ));
+            match_type = "Legacy/P2WPKH (Compressed/bc1q)";
+        } else if comparer.is_match_20b(&wallet.h160_u) {
+            match_type = "Legacy (Uncompressed)";
+        } else if comparer.is_match_20b(&wallet.h160_nested) {
+            match_type = "Nested SegWit (3...)";
+        } else if comparer.is_match_32b(&wallet.taproot) {
+            match_type = "Taproot (bc1p...)";
         }
 
-        // 2. Legacy (Uncompressed)
-        if comparer.is_match_20b(&wallet.h160_u) {
-            pb.println(format!(
-                "\nMATCH! (1... Uncomp) Pass: {:?}",
-                String::from_utf8_lossy(line)
-            ));
+        // Eğer bir eşleşme varsa dosyaya güvenli bir şekilde yaz
+        if !match_type.is_empty() {
+            let log_entry = format!("MATCH! Type: {} | Pass: {}\n", match_type, pass_str);
+
+            // Mutex ile dosyayı kilitle ve yaz (Thread-safe)
+            if let Ok(mut file) = found_file.lock() {
+                let _ = file.write_all(log_entry.as_bytes());
+                let _ = file.flush(); // Hemen diske yazılmasını sağla
+            }
+
+            pb.println(format!("\n{}", log_entry));
         }
 
-        // 3. Nested SegWit (3...)
-        if comparer.is_match_20b(&wallet.h160_nested) {
-            pb.println(format!(
-                "\nMATCH! (3...) Pass: {:?}",
-                String::from_utf8_lossy(line)
-            ));
-        }
-
-        // 4. Taproot (bc1p)
-        if comparer.is_match_32b(&wallet.taproot) {
-            pb.println(format!(
-                "\nMATCH! (bc1p...) Pass: {:?}",
-                String::from_utf8_lossy(line)
-            ));
-        }
-
-        // Progress bar'ı 10.000 satırda bir güncelle (Kritik hız ayarı!)
+        // Hız için batch güncelleme
         let c = local_counter.fetch_add(1, Ordering::Relaxed);
         if c % 10_000 == 0 {
             pb.inc(10_000);
