@@ -1,13 +1,10 @@
-use crate::comparer::Comparer;
-
 mod brainwallet;
 mod comparer;
 mod reader;
 
 fn main() {
-    println!("Target addresses loading...");
-    let comparer = Comparer::load_from_file("targets.txt");
+    let comparer = comparer::Comparer::load_from_json("targets.json");
+    println!("Loaded targets. Starting scan...");
 
-    println!("Dictionary file getting read...");
     reader::start_cracking("rockyou.txt", &comparer);
 }

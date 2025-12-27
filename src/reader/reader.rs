@@ -1,39 +1,54 @@
 use crate::brainwallet::BrainWallet;
 use crate::comparer::Comparer;
+use memmap2::Mmap;
 use rayon::prelude::*;
+use secp256k1::Secp256k1;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 pub fn start_cracking(dict_path: &str, comparer: &Comparer) {
-    let file = File::open(dict_path).expect("Dictionary file not found");
-    let reader = BufReader::new(file);
+    let file = File::open(dict_path).expect("Dict not found");
+    let mmap = unsafe { Mmap::map(&file).expect("Mmap failed") };
+    let total_checks = AtomicU64::new(0);
+    let start_time = Instant::now();
 
-    let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+    // Context her thread için ayrı oluşturulur (En hızlısı)
+    let secp = Secp256k1::new();
 
-    println!("Scanning starting...");
+    println!("Scanning started...");
 
-    lines.par_iter().for_each(|passphrase| {
-        let wallet = BrainWallet::new(passphrase);
-        if comparer.is_match(&wallet.generated_wallet.compressed_point_conversion.hash160) {
+    // Dosyayı satır sonlarına göre böl ve paralel işle
+    mmap.par_split(|&b| b == b'\n').for_each(|line| {
+        if line.is_empty() {
+            return;
+        }
+
+        let wallet = BrainWallet::fast_generate(line, &secp);
+
+        // Compressed Check
+        if comparer.is_match(&wallet.h160_compressed) {
             println!(
-                "!!! MATCH FOUND (Compressed) !!! Pass: {} Addr: {}",
-                passphrase, wallet.generated_wallet.compressed_point_conversion.address
+                "\n!!! MATCH FOUND !!! Pass: {:?} | Addr Type: Compressed",
+                String::from_utf8_lossy(line)
             );
         }
 
-        if comparer.is_match(
-            &wallet
-                .generated_wallet
-                .uncompressed_point_conversion
-                .hash160,
-        ) {
+        // Uncompressed Check
+        if comparer.is_match(&wallet.h160_uncompressed) {
             println!(
-                "!!! MATCH FOUND (Uncompressed) !!! Pass: {} Addr: {}",
-                passphrase,
-                wallet
-                    .generated_wallet
-                    .uncompressed_point_conversion
-                    .address
+                "\n!!! MATCH FOUND !!! Pass: {:?} | Addr Type: Uncompressed",
+                String::from_utf8_lossy(line)
+            );
+        }
+
+        let current = total_checks.fetch_add(1, Ordering::Relaxed);
+        if current % 1_000_000 == 0 && current > 0 {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            println!(
+                "Speed: {:.2} Million/sec | Total: {}M",
+                (current as f64 / elapsed) / 1_000_000.0,
+                current / 1_000_000
             );
         }
     });

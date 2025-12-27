@@ -1,38 +1,37 @@
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+
+#[derive(Deserialize)]
+struct TargetFile {
+    addresses: Vec<String>,
+}
 
 pub struct Comparer {
-    target_hashes: HashSet<[u8; 20]>, //  store 20 byte Hash as binary
+    pub target_hashes: HashSet<[u8; 20]>,
 }
 
 impl Comparer {
-    pub fn load_from_file(path: &str) -> Self {
-        let file = File::open(path).expect("Targets address file not found");
-        let reader = BufReader::new(file);
-        let mut target_hashes = HashSet::with_capacity(60_000_000);
+    pub fn load_from_json(path: &str) -> Self {
+        let file = File::open(path).expect("JSON not found");
+        let data: TargetFile = serde_json::from_reader(file).expect("JSON parse error");
 
-        for line in reader.lines() {
-            if let Ok(addr) = line {
-                // Burada base58 adresi Hash160'a çevirme mantığı olmalı
-                // Hız için dosyayı doğrudan Hash160 (hex) olarak hazırlamanı öneririm
-                if let Ok(decoded) = hex::decode(addr) {
+        let mut target_hashes = HashSet::with_capacity(data.addresses.len());
+
+        for addr in data.addresses {
+            if let Ok(decoded) = bs58::decode(addr).with_check(None).into_vec() {
+                if decoded.len() >= 21 {
                     let mut hash = [0u8; 20];
-                    hash.copy_from_slice(&decoded[..20]);
+                    hash.copy_from_slice(&decoded[1..21]);
                     target_hashes.insert(hash);
                 }
             }
         }
-        println!("{} addresses loaded.", target_hashes.len());
         Comparer { target_hashes }
     }
 
-    pub fn is_match(&self, hash160_hex: &str) -> bool {
-        if let Ok(bytes) = hex::decode(hash160_hex) {
-            let mut check = [0u8; 20];
-            check.copy_from_slice(&bytes);
-            return self.target_hashes.contains(&check);
-        }
-        false
+    #[inline(always)]
+    pub fn is_match(&self, hash: &[u8; 20]) -> bool {
+        self.target_hashes.contains(hash)
     }
 }
