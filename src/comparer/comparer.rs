@@ -1,8 +1,8 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use rayon::prelude::*;
+use rustc_hash::FxHashSet;
 use serde::Deserialize;
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 
@@ -16,10 +16,10 @@ struct TargetFile {
 const CACHE_HEADER_SIZE: usize = 16;
 
 pub struct Comparer {
-    pub btc_20: HashSet<[u8; 20]>,
-    pub btc_32: HashSet<[u8; 32]>,
-    pub eth_20: HashSet<[u8; 20]>,
-    pub sol_32: HashSet<[u8; 32]>,
+    pub btc_20: FxHashSet<[u8; 20]>,
+    pub btc_32: FxHashSet<[u8; 32]>,
+    pub eth_20: FxHashSet<[u8; 20]>,
+    pub sol_32: FxHashSet<[u8; 32]>,
     pub btc_on: bool,
     pub eth_on: bool,
     pub sol_on: bool,
@@ -59,7 +59,7 @@ impl Comparer {
     }
 
     /// Mmap ile cache'den yükle - O(n) yükleme, O(1) lookup, false positive YOK
-    fn load_from_cache(bin_path: &str) -> Option<(HashSet<[u8; 20]>, HashSet<[u8; 32]>)> {
+    fn load_from_cache(bin_path: &str) -> Option<(FxHashSet<[u8; 20]>, FxHashSet<[u8; 32]>)> {
         let file = File::open(bin_path).ok()?;
         let mmap = unsafe { Mmap::map(&file).ok()? };
         
@@ -81,8 +81,8 @@ impl Comparer {
         let h20_end = h20_start + h20_count * 20;
         let h32_end = h20_end + h32_count * 32;
         
-        // Paralel HashSet oluşturma (Rayon)
-        let h20: HashSet<[u8; 20]> = mmap[h20_start..h20_end]
+        // Paralel FxHashSet oluşturma (Rayon) - 3-5x daha hızlı hash
+        let h20: FxHashSet<[u8; 20]> = mmap[h20_start..h20_end]
             .par_chunks_exact(20)
             .map(|chunk| {
                 let mut arr = [0u8; 20];
@@ -91,7 +91,7 @@ impl Comparer {
             })
             .collect();
         
-        let h32: HashSet<[u8; 32]> = mmap[h20_end..h32_end]
+        let h32: FxHashSet<[u8; 32]> = mmap[h20_end..h32_end]
             .par_chunks_exact(32)
             .map(|chunk| {
                 let mut arr = [0u8; 32];
@@ -104,7 +104,7 @@ impl Comparer {
     }
     
     /// Cache'e raw bytes olarak yaz
-    fn save_to_cache(bin_path: &str, h20: &HashSet<[u8; 20]>, h32: &HashSet<[u8; 32]>) -> std::io::Result<()> {
+    fn save_to_cache(bin_path: &str, h20: &FxHashSet<[u8; 20]>, h32: &FxHashSet<[u8; 32]>) -> std::io::Result<()> {
         let file = File::create(bin_path)?;
         let mut writer = BufWriter::with_capacity(1024 * 1024, file); // 1MB buffer
         
@@ -126,7 +126,7 @@ impl Comparer {
         Ok(())
     }
 
-    fn load_net(name: &str) -> (HashSet<[u8; 20]>, HashSet<[u8; 32]>) {
+    fn load_net(name: &str) -> (FxHashSet<[u8; 20]>, FxHashSet<[u8; 32]>) {
         let json_path = format!("{}_targets.json", name);
         let bin_path = format!("{}_targets.bin", name);
 
@@ -154,7 +154,7 @@ impl Comparer {
 
         // JSON dosyası var mı?
         if !std::path::Path::new(&json_path).exists() {
-            return (HashSet::new(), HashSet::new());
+            return (FxHashSet::default(), FxHashSet::default());
         }
 
         let size_mb = std::fs::metadata(&json_path)
@@ -172,7 +172,7 @@ impl Comparer {
             Ok(f) => f,
             Err(_) => {
                 parse_pb.finish_with_message(format!("❌ {} dosyası açılamadı", name));
-                return (HashSet::new(), HashSet::new());
+                return (FxHashSet::default(), FxHashSet::default());
             }
         };
         
@@ -183,13 +183,14 @@ impl Comparer {
             }
             Err(e) => {
                 parse_pb.finish_with_message(format!("❌ {} JSON hatası: {}", name, e));
-                return (HashSet::new(), HashSet::new());
+                return (FxHashSet::default(), FxHashSet::default());
             }
         };
         
         let total = data.addresses.len();
-        let mut h20 = HashSet::with_capacity(total);
-        let mut h32 = HashSet::new();
+        let mut h20: FxHashSet<[u8; 20]> = FxHashSet::default();
+        h20.reserve(total);
+        let mut h32: FxHashSet<[u8; 32]> = FxHashSet::default();
         
         // Adres işleme
         let pb = ProgressBar::new(total as u64);
