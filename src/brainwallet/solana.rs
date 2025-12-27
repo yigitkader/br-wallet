@@ -17,11 +17,16 @@ impl SolWallet {
     }
 
     pub fn get_report(&self, pass: &str) -> String {
+        // Solana keypair = seed (32) + pubkey (32) = 64 bytes
+        let mut keypair = [0u8; 64];
+        keypair[..32].copy_from_slice(&self.priv_bytes);
+        keypair[32..].copy_from_slice(&self.address);
+        
         format!(
-            "[SOL MATCH] Pass: {}\nAddr: {}\nPriv: {}\n",
+            "[SOL MATCH] Pass: {}\nAddr: {}\nKeypair: {}\n",
             pass,
             bs58::encode(self.address).into_string(),
-            bs58::encode(self.priv_bytes).into_string()
+            bs58::encode(keypair).into_string()
         )
     }
 }

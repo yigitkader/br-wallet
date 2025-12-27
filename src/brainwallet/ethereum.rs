@@ -8,8 +8,9 @@ pub struct EthWallet {
 
 impl EthWallet {
     #[inline(always)]
-    pub fn generate(priv_bytes: [u8; 32]) -> Self {
-        let sk = SecretKey::from_slice(&priv_bytes).unwrap();
+    pub fn generate(priv_bytes: [u8; 32]) -> Option<Self> {
+        // secp256k1 private key: 1 <= key < curve_order
+        let sk = SecretKey::from_slice(&priv_bytes).ok()?;
         let pk = PublicKey::from_secret_key(SECP256K1, &sk);
 
         let mut k = Keccak::v256();
@@ -19,10 +20,10 @@ impl EthWallet {
 
         let mut address = [0u8; 20];
         address.copy_from_slice(&h[12..32]); // Son 20 byte
-        EthWallet {
+        Some(EthWallet {
             priv_bytes,
             address,
-        }
+        })
     }
 
     pub fn get_report(&self, pass: &str) -> String {

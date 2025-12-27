@@ -1,30 +1,68 @@
 use crate::brainwallet::MultiWallet;
 use crate::comparer::Comparer;
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex,
 };
 
+/// Ortalama satır uzunluğunu tahmin ederek satır sayısını hesaplar (çift taramadan kaçınır)
+fn estimate_line_count(file_size: u64) -> u64 {
+    // Tipik rockyou.txt ortalama satır uzunluğu ~9 karakter + newline
+    const AVG_LINE_LENGTH: u64 = 10;
+    file_size / AVG_LINE_LENGTH
+}
+
+/// Windows/Unix satır sonu karakterlerini temizler (\r\n -> \n uyumu)
+#[inline(always)]
+fn trim_line(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    // Sondaki \r ve boşlukları temizle
+    while end > 0 && matches!(line[end - 1], b'\r' | b' ' | b'\t') {
+        end -= 1;
+    }
+    // Baştaki boşlukları temizle
+    let mut start = 0;
+    while start < end && matches!(line[start], b' ' | b'\t') {
+        start += 1;
+    }
+    &line[start..end]
+}
+
 pub fn start_cracking(dict: &str, comparer: &Comparer) {
     let file = std::fs::File::open(dict).expect("Dict missing");
+    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mmap = unsafe { Mmap::map(&file).unwrap() };
-    let log = Mutex::new(
+    
+    // BufWriter ile daha verimli dosya yazımı
+    let log = Mutex::new(BufWriter::new(
         OpenOptions::new()
             .append(true)
             .create(true)
             .open("found.txt")
             .unwrap(),
-    );
+    ));
 
-    let pb = ProgressBar::new(mmap.par_split(|&b| b == b'\n').count() as u64);
+    // Çift tarama yerine tahmini satır sayısı kullan
+    let estimated_lines = estimate_line_count(file_size);
+    let pb = ProgressBar::new(estimated_lines);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec})")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+    
     let counter = AtomicU64::new(0);
 
-    mmap.par_split(|&b| b == b'\n').for_each(|line| {
+    mmap.par_split(|&b| b == b'\n').for_each(|raw_line| {
+        // Windows satır sonu temizliği (\r karakteri)
+        let line = trim_line(raw_line);
+        
         if line.is_empty() {
             return;
         }
@@ -36,6 +74,7 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
 
         if let Some(btc) = w.btc {
             if comparer.btc_20.contains(&btc.h160_c)
+                || comparer.btc_20.contains(&btc.h160_u)  // Legacy uncompressed
                 || comparer.btc_20.contains(&btc.h160_nested)
                 || comparer.btc_32.contains(&btc.taproot)
             {
@@ -56,6 +95,7 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
         if !rep.is_empty() {
             let mut f = log.lock().unwrap();
             let _ = f.write_all(rep.as_bytes());
+            let _ = f.flush(); // Kritik buluş için hemen disk'e yaz
             pb.println(format!("\n{}", rep));
         }
 
@@ -63,5 +103,11 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
             pb.inc(10_000);
         }
     });
-    pb.finish();
+    
+    // BufWriter'ı flush et
+    if let Ok(mut f) = log.lock() {
+        let _ = f.flush();
+    }
+    
+    pb.finish_with_message("Tarama tamamlandı!");
 }

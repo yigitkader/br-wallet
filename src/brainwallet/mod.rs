@@ -19,13 +19,14 @@ impl MultiWallet {
         priv_bytes.copy_from_slice(&priv_hash);
 
         Self {
+            // BTC ve ETH generate artık Option döner (geçersiz key için None)
             btc: if btc_on {
-                Some(bitcoin::BtcWallet::generate(priv_bytes))
+                bitcoin::BtcWallet::generate(priv_bytes)
             } else {
                 None
             },
             eth: if eth_on {
-                Some(ethereum::EthWallet::generate(priv_bytes))
+                ethereum::EthWallet::generate(priv_bytes)
             } else {
                 None
             },

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 
 #[derive(Deserialize, Serialize)]
 struct TargetFile {
@@ -24,10 +24,26 @@ impl Comparer {
         let (eth_20, _) = Self::load_net("ethereum", "eth.bin");
         let (_, sol_32) = Self::load_net("solana", "sol.bin");
 
+        // Yüklenen adres sayılarını göster
+        let btc_count = btc_20.len() + btc_32.len();
+        let eth_count = eth_20.len();
+        let sol_count = sol_32.len();
+        
+        if btc_count > 0 {
+            println!("📦 Bitcoin: {} adres (Legacy/SegWit: {}, Taproot: {})", 
+                     btc_count, btc_20.len(), btc_32.len());
+        }
+        if eth_count > 0 {
+            println!("📦 Ethereum: {} adres", eth_count);
+        }
+        if sol_count > 0 {
+            println!("📦 Solana: {} adres", sol_count);
+        }
+
         Comparer {
-            btc_on: !btc_20.is_empty() || !btc_32.is_empty(),
-            eth_on: !eth_20.is_empty(),
-            sol_on: !sol_32.is_empty(),
+            btc_on: btc_count > 0,
+            eth_on: eth_count > 0,
+            sol_on: sol_count > 0,
             btc_20,
             btc_32,
             eth_20,
@@ -39,15 +55,36 @@ impl Comparer {
         let mut h20 = HashSet::new();
         let mut h32 = HashSet::new();
 
+        // Önce binary cache'i dene
         if std::path::Path::new(bin).exists() {
-            let f = File::open(bin).unwrap();
-            return bincode::deserialize_from(BufReader::new(f)).unwrap();
+            if let Ok(f) = File::open(bin) {
+                match bincode::deserialize_from(BufReader::new(f)) {
+                    Ok(data) => return data,
+                    Err(e) => {
+                        eprintln!("⚠️  Cache dosyası bozuk ({}): {}", bin, e);
+                        // Bozuk cache'i sil, JSON'dan yeniden yükle
+                        let _ = std::fs::remove_file(bin);
+                    }
+                }
+            }
         }
 
         let json = format!("{}_targets.json", name);
         if let Ok(f) = File::open(&json) {
-            let data: TargetFile = serde_json::from_reader(BufReader::new(f)).unwrap();
-            for a in data.addresses {
+            let data: TargetFile = match serde_json::from_reader(BufReader::new(f)) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("⚠️  JSON parse hatası ({}): {}", json, e);
+                    return (h20, h32);
+                }
+            };
+            for raw_addr in data.addresses {
+                // Whitespace temizliği
+                let a = raw_addr.trim();
+                if a.is_empty() {
+                    continue;
+                }
+                
                 match name {
                     "bitcoin" => {
                         if a.starts_with("bc1") {
@@ -82,7 +119,7 @@ impl Comparer {
                 }
             }
             if !h20.is_empty() || !h32.is_empty() {
-                let mut cache = File::create(bin).unwrap();
+                let cache = File::create(bin).unwrap();
                 bincode::serialize_into(cache, &(&h20, &h32)).unwrap();
             }
         }
