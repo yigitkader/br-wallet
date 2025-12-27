@@ -4,9 +4,8 @@ use sha2::{Digest, Sha256};
 
 pub struct BtcWallet {
     pub priv_bytes: [u8; 32],
-    pub h160_c: [u8; 20],       // Legacy & Native SegWit (compressed)
-    #[allow(dead_code)]
-    pub h160_u: [u8; 20],       // Legacy Uncomp (gelecekte kullanılabilir)
+    pub h160_c: [u8; 20],       // Legacy P2PKH (compressed) & Native SegWit
+    pub h160_u: [u8; 20],       // Legacy P2PKH (uncompressed)
     pub h160_nested: [u8; 20],  // Nested SegWit (P2SH-P2WPKH)
     pub taproot: [u8; 32],      // Taproot (BIP341 tweaked)
 }
