@@ -88,39 +88,44 @@ impl Comparer {
                 match name {
                     "bitcoin" => {
                         if a.starts_with("bc1") {
-                            if let Ok((_, _, p)) = bech32::segwit::decode(&a) {
-                                if p.len() == 20 {
-                                    h20.insert(p.try_into().unwrap());
-                                } else {
-                                    h32.insert(p.try_into().unwrap());
+                            if let Ok((_, _, p)) = bech32::segwit::decode(a) {
+                                // Native SegWit (bc1q) = 20 byte, Taproot (bc1p) = 32 byte
+                                if let Ok(arr) = <[u8; 20]>::try_from(p.as_slice()) {
+                                    h20.insert(arr);
+                                } else if let Ok(arr) = <[u8; 32]>::try_from(p.as_slice()) {
+                                    h32.insert(arr);
                                 }
+                                // Diğer uzunluklar sessizce atlanır
                             }
-                        } else if let Ok(d) = bs58::decode(&a).with_check(None).into_vec() {
-                            if d.len() >= 21 {
-                                h20.insert(d[1..21].try_into().unwrap());
+                        } else if let Ok(d) = bs58::decode(a).with_check(None).into_vec() {
+                            // Legacy (1...) ve P2SH (3...) = 21 byte (1 version + 20 hash)
+                            if let Ok(arr) = <[u8; 20]>::try_from(&d[1..21]) {
+                                h20.insert(arr);
                             }
                         }
                     }
                     "ethereum" => {
                         if let Ok(b) = hex::decode(a.trim_start_matches("0x")) {
-                            if b.len() == 20 {
-                                h20.insert(b.try_into().unwrap());
+                            if let Ok(arr) = <[u8; 20]>::try_from(b.as_slice()) {
+                                h20.insert(arr);
                             }
                         }
                     }
                     "solana" => {
-                        if let Ok(b) = bs58::decode(&a).into_vec() {
-                            if b.len() == 32 {
-                                h32.insert(b.try_into().unwrap());
+                        if let Ok(b) = bs58::decode(a).into_vec() {
+                            if let Ok(arr) = <[u8; 32]>::try_from(b.as_slice()) {
+                                h32.insert(arr);
                             }
                         }
                     }
                     _ => {}
                 }
             }
+            // Binary cache oluştur (hata olursa sessizce atla)
             if !h20.is_empty() || !h32.is_empty() {
-                let cache = File::create(bin).unwrap();
-                bincode::serialize_into(cache, &(&h20, &h32)).unwrap();
+                if let Ok(cache) = File::create(bin) {
+                    let _ = bincode::serialize_into(cache, &(&h20, &h32));
+                }
             }
         }
         (h20, h32)
