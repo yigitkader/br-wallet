@@ -13,8 +13,9 @@ pub struct Comparer {
 
 impl Comparer {
     pub fn load_from_json(path: &str) -> Self {
-        let file = File::open(path).expect("JSON not found");
-        let data: TargetFile = serde_json::from_reader(file).expect("JSON parse error");
+        println!("Loading targets from JSON...");
+        let file = File::open(path).expect("Target JSON file not found");
+        let data: TargetFile = serde_json::from_reader(file).expect("JSON parsing failed");
 
         let mut target_hashes = HashSet::with_capacity(data.addresses.len());
 
@@ -27,6 +28,7 @@ impl Comparer {
                 }
             }
         }
+        println!("{} targets loaded into memory.", target_hashes.len());
         Comparer { target_hashes }
     }
 
