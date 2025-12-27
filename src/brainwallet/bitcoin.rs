@@ -24,20 +24,15 @@ impl BtcWallet {
 
     /// BIP341 Taproot output key türetmesi (keypath-only, merkle root yok)
     #[inline(always)]
-    fn compute_taproot_output_key(internal_key: &XOnlyPublicKey) -> [u8; 32] {
+    fn compute_taproot_output_key(internal_key: &XOnlyPublicKey) -> Option<[u8; 32]> {
         // t = tagged_hash("TapTweak", P) - merkle root olmadan
         let tweak_hash = Self::tagged_hash("TapTweak", &internal_key.serialize());
         
         // Q = P + t*G (tweaked public key)
-        // secp256k1 add_tweak metodu bunu yapıyor
-        let tweak = secp256k1::Scalar::from_be_bytes(tweak_hash)
-            .expect("Invalid tweak scalar");
+        let tweak = secp256k1::Scalar::from_be_bytes(tweak_hash).ok()?;
+        let (tweaked_key, _parity) = internal_key.add_tweak(SECP256K1, &tweak).ok()?;
         
-        let (tweaked_key, _parity) = internal_key
-            .add_tweak(SECP256K1, &tweak)
-            .expect("Tweak addition failed");
-        
-        tweaked_key.serialize()
+        Some(tweaked_key.serialize())
     }
 
     #[inline(always)]
@@ -61,7 +56,7 @@ impl BtcWallet {
         // BIP341 Taproot: Internal key'den tweaked output key türet
         let keypair = Keypair::from_secret_key(SECP256K1, &sk);
         let (internal_key, _parity) = XOnlyPublicKey::from_keypair(&keypair);
-        let taproot = Self::compute_taproot_output_key(&internal_key);
+        let taproot = Self::compute_taproot_output_key(&internal_key)?;
 
         Some(BtcWallet {
             priv_bytes,
@@ -73,26 +68,36 @@ impl BtcWallet {
     }
 
     pub fn get_report(&self, pass: &str) -> String {
+        // WIF (Wallet Import Format) - compressed
         let mut wif_b = vec![0x80];
         wif_b.extend_from_slice(&self.priv_bytes);
-        wif_b.push(0x01);
+        wif_b.push(0x01); // compressed flag
         let wif = bs58::encode(&wif_b).with_check().into_string();
+        
         let hrp = bech32::Hrp::parse("bc").unwrap();
 
         format!(
-            "[BTC MATCH] Pass: {}\nWIF: {}\nAddr: {}, {}, {}\n",
+            "[BTC MATCH] Pass: {}\n\
+             WIF: {}\n\
+             Legacy (1...):     {}\n\
+             Legacy Uncomp:     {}\n\
+             P2SH-SegWit (3...): {}\n\
+             Native SegWit:     {}\n\
+             Taproot:           {}\n",
             pass,
             wif,
-            self.to_b58(0x00, &self.h160_c),
+            Self::to_b58_static(0x00, &self.h160_c),           // P2PKH (compressed)
+            Self::to_b58_static(0x00, &self.h160_u),           // P2PKH (uncompressed)
+            Self::to_b58_static(0x05, &self.h160_nested),      // P2SH-P2WPKH (version 0x05!)
             bech32::segwit::encode(hrp, bech32::segwit::VERSION_0, &self.h160_c).unwrap(),
             bech32::segwit::encode(hrp, bech32::segwit::VERSION_1, &self.taproot).unwrap()
         )
     }
 
-    fn to_b58(&self, v: u8, h: &[u8; 20]) -> String {
-        let mut p = vec![v];
-        p.extend_from_slice(h);
-        bs58::encode(&p).with_check().into_string()
+    fn to_b58_static(version: u8, hash: &[u8; 20]) -> String {
+        let mut payload = vec![version];
+        payload.extend_from_slice(hash);
+        bs58::encode(&payload).with_check().into_string()
     }
 
     fn hash160(data: &[u8]) -> [u8; 20] {

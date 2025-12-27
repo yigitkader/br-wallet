@@ -17,20 +17,16 @@ fn estimate_line_count(file_size: u64) -> u64 {
     file_size / AVG_LINE_LENGTH
 }
 
-/// Windows/Unix satır sonu karakterlerini temizler (\r\n -> \n uyumu)
+/// Sadece Windows satır sonu karakterini temizler (\r)
+/// NOT: Boşluk ve tab karakterleri brainwallet passphrase'inin parçası olabilir!
 #[inline(always)]
-fn trim_line(line: &[u8]) -> &[u8] {
-    let mut end = line.len();
-    // Sondaki \r ve boşlukları temizle
-    while end > 0 && matches!(line[end - 1], b'\r' | b' ' | b'\t') {
-        end -= 1;
+fn strip_cr(line: &[u8]) -> &[u8] {
+    // Sadece sondaki \r karakterini temizle (Windows CRLF uyumu)
+    if line.ends_with(b"\r") {
+        &line[..line.len() - 1]
+    } else {
+        line
     }
-    // Baştaki boşlukları temizle
-    let mut start = 0;
-    while start < end && matches!(line[start], b' ' | b'\t') {
-        start += 1;
-    }
-    &line[start..end]
 }
 
 pub fn start_cracking(dict: &str, comparer: &Comparer) {
@@ -60,8 +56,8 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
     let counter = AtomicU64::new(0);
 
     mmap.par_split(|&b| b == b'\n').for_each(|raw_line| {
-        // Windows satır sonu temizliği (\r karakteri)
-        let line = trim_line(raw_line);
+        // Sadece Windows \r karakterini temizle (boşluklar passphrase parçası!)
+        let line = strip_cr(raw_line);
         
         if line.is_empty() {
             return;
@@ -95,19 +91,28 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
         if !rep.is_empty() {
             let mut f = log.lock().unwrap();
             let _ = f.write_all(rep.as_bytes());
-            let _ = f.flush(); // Kritik buluş için hemen disk'e yaz
+            // flush() kaldırıldı - BufWriter kendi buffer'ını yönetsin
+            // Program sonunda zaten flush ediliyor
             pb.println(format!("\n{}", rep));
         }
 
-        if counter.fetch_add(1, Ordering::Relaxed) % 10_000 == 0 {
-            pb.inc(10_000);
+        // Progress bar güncelleme - set_position daha güvenli
+        let current = counter.fetch_add(1, Ordering::Relaxed);
+        if current % 10_000 == 0 {
+            pb.set_position(current);
         }
     });
     
-    // BufWriter'ı flush et
-    if let Ok(mut f) = log.lock() {
-        let _ = f.flush();
+    // Son durumu güncelle
+    let final_count = counter.load(Ordering::Relaxed);
+    pb.set_position(final_count);
+    
+    // BufWriter'ı flush et (blok içinde drop edilsin)
+    {
+        if let Ok(mut f) = log.lock() {
+            let _ = f.flush();
+        }
     }
     
-    pb.finish_with_message("Tarama tamamlandı!");
+    pb.finish_with_message(format!("Tamamlandı! {} satır tarandı.", final_count));
 }
