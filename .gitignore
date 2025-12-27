@@ -1,0 +1,13 @@
+/target
+
+# Ignore IDE specific files
+/.idea
+*.iml
+*.xml
+.vscode/
+*.code-workspace
+.DS_Store
+/node_modules
+/dist
+/build
+.env

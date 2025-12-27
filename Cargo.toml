@@ -1,0 +1,14 @@
+[package]
+name = "brwallet"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sha2 = "0.10"
+ripemd = "0.1"
+k256 = { version = "0.13", features = ["ecdsa"] }
+bs58 = { version = "0.5", features = ["check"] }
+hex = "0.4"
+bech32 = "0.11.0"
+serde = { version = "1.0.228", features = ["derive"] }
+rayon = "1.11.0" # Native SegWit ve Taproot için
