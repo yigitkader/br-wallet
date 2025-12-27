@@ -20,9 +20,9 @@ pub struct Comparer {
 
 impl Comparer {
     pub fn load() -> Self {
-        let (btc_20, btc_32) = Self::load_net("bitcoin", "btc.bin");
-        let (eth_20, _) = Self::load_net("ethereum", "eth.bin");
-        let (_, sol_32) = Self::load_net("solana", "sol.bin");
+        let (btc_20, btc_32) = Self::load_net("bitcoin");
+        let (eth_20, _) = Self::load_net("ethereum");
+        let (_, sol_32) = Self::load_net("solana");
 
         // Yüklenen adres sayılarını göster
         let btc_count = btc_20.len() + btc_32.len();
@@ -51,25 +51,32 @@ impl Comparer {
         }
     }
 
-    fn load_net(name: &str, bin: &str) -> (HashSet<[u8; 20]>, HashSet<[u8; 32]>) {
+    fn load_net(name: &str) -> (HashSet<[u8; 20]>, HashSet<[u8; 32]>) {
         let mut h20 = HashSet::new();
         let mut h32 = HashSet::new();
+        
+        // Tutarlı dosya isimleri: {name}_targets.json → {name}_targets.bin
+        let json_path = format!("{}_targets.json", name);
+        let bin_path = format!("{}_targets.bin", name);
 
-        // Önce binary cache'i dene
-        if std::path::Path::new(bin).exists() {
-            if let Ok(f) = File::open(bin) {
+        // Önce binary cache'i dene (daha hızlı yükleme)
+        if std::path::Path::new(&bin_path).exists() {
+            if let Ok(f) = File::open(&bin_path) {
                 match bincode::deserialize_from(BufReader::new(f)) {
-                    Ok(data) => return data,
+                    Ok(data) => {
+                        return data;
+                    }
                     Err(e) => {
-                        eprintln!("⚠️  Cache dosyası bozuk ({}): {}", bin, e);
+                        eprintln!("⚠️  Cache dosyası bozuk ({}): {}", bin_path, e);
                         // Bozuk cache'i sil, JSON'dan yeniden yükle
-                        let _ = std::fs::remove_file(bin);
+                        let _ = std::fs::remove_file(&bin_path);
                     }
                 }
             }
         }
 
-        let json = format!("{}_targets.json", name);
+        // JSON'dan yükle
+        let json = &json_path;
         if let Ok(f) = File::open(&json) {
             let data: TargetFile = match serde_json::from_reader(BufReader::new(f)) {
                 Ok(d) => d,
@@ -121,10 +128,12 @@ impl Comparer {
                     _ => {}
                 }
             }
-            // Binary cache oluştur (hata olursa sessizce atla)
+            // Binary cache oluştur (sonraki çalıştırmalar için)
             if !h20.is_empty() || !h32.is_empty() {
-                if let Ok(cache) = File::create(bin) {
-                    let _ = bincode::serialize_into(cache, &(&h20, &h32));
+                if let Ok(cache) = File::create(&bin_path) {
+                    if bincode::serialize_into(cache, &(&h20, &h32)).is_ok() {
+                        println!("💾 Cache oluşturuldu: {}", bin_path);
+                    }
                 }
             }
         }
