@@ -32,6 +32,8 @@ fn strip_cr(line: &[u8]) -> &[u8] {
 pub fn start_cracking(dict: &str, comparer: &Comparer) {
     let file = std::fs::File::open(dict).expect("Dict missing");
     let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    
+    // Memory-mapped file yükle
     let mmap = unsafe { Mmap::map(&file).unwrap() };
     
     // BufWriter ile daha verimli dosya yazımı
@@ -48,10 +50,12 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
     let pb = ProgressBar::new(estimated_lines);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec})")
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} (~{eta} kaldı) {msg}")
             .unwrap()
-            .progress_chars("=>-"),
+            .progress_chars("█▓░"),
     );
+    pb.set_message("taranıyor...");
+    pb.set_position(0); // İlk görünümü zorla
     
     let counter = AtomicU64::new(0);
 
@@ -96,9 +100,9 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
             pb.println(format!("\n{}", rep));
         }
 
-        // Progress bar güncelleme - set_position daha güvenli
+        // Progress bar güncelleme - her 1000 satırda bir (daha responsive)
         let current = counter.fetch_add(1, Ordering::Relaxed);
-        if current % 10_000 == 0 {
+        if current % 1_000 == 0 {
             pb.set_position(current);
         }
     });

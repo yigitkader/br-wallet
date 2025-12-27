@@ -6,20 +6,43 @@ fn main() {
     println!("--- Universal Blockchain Brainwallet Cracker v2.1 ---");
     println!("Ağlar: Bitcoin (Legacy, SegWit, Taproot), Ethereum, Solana\n");
 
+    // Dictionary dosyası
+    let dict_path = std::env::args().nth(1).unwrap_or_else(|| "weakpass_4.merged.txt".to_string());
+    
+    // Dosya varlığını kontrol et
+    if !std::path::Path::new(&dict_path).exists() {
+        eprintln!("❌ Hata: Dictionary dosyası bulunamadı: {}", dict_path);
+        eprintln!("   Kullanım: brwallet <wordlist.txt>");
+        return;
+    }
+
+    println!("🔍 Hedef adresler yükleniyor...");
     let comparer = comparer::Comparer::load();
     
     if !comparer.btc_on && !comparer.eth_on && !comparer.sol_on {
-        eprintln!("⚠️  Uyarı: Hiçbir hedef adres yüklenmedi!");
-        eprintln!("   bitcoin_targets.json, ethereum_targets.json veya solana_targets.json dosyalarını kontrol edin.");
+        eprintln!("\n⚠️  Uyarı: Hiçbir hedef adres yüklenmedi!");
+        eprintln!("   Aşağıdaki dosyaları oluşturun:");
+        eprintln!("   - bitcoin_targets.json");
+        eprintln!("   - ethereum_targets.json");
+        eprintln!("   - solana_targets.json");
+        eprintln!("\n   Format: {{\"addresses\": [\"addr1\", \"addr2\", ...]}}");
         return;
     }
     
     println!(
-        "Aktif ağlar: {}{}{}",
+        "\n✅ Aktif ağlar: {}{}{}",
         if comparer.btc_on { "BTC " } else { "" },
         if comparer.eth_on { "ETH " } else { "" },
         if comparer.sol_on { "SOL " } else { "" }
     );
     
-    reader::start_cracking("rockyou.txt", &comparer);
+    // Dictionary boyutunu göster
+    if let Ok(meta) = std::fs::metadata(&dict_path) {
+        let size_mb = meta.len() as f64 / 1_048_576.0;
+        println!("📖 Dictionary: {} ({:.2} MB)", dict_path, size_mb);
+    }
+    
+    println!("\n🚀 Tarama başlatılıyor...\n");
+    
+    reader::start_cracking(&dict_path, &comparer);
 }
