@@ -1,7 +1,8 @@
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 
 #[derive(Deserialize, Serialize)]
 struct TargetFile {
@@ -29,6 +30,7 @@ impl Comparer {
         let eth_count = eth_20.len();
         let sol_count = sol_32.len();
         
+        println!(); // Boş satır
         if btc_count > 0 {
             println!("📦 Bitcoin: {} adres (Legacy/SegWit: {}, Taproot: {})", 
                      btc_count, btc_20.len(), btc_32.len());
@@ -55,125 +57,158 @@ impl Comparer {
         let mut h20 = HashSet::new();
         let mut h32 = HashSet::new();
         
-        // Tutarlı dosya isimleri: {name}_targets.json → {name}_targets.bin
         let json_path = format!("{}_targets.json", name);
         let bin_path = format!("{}_targets.bin", name);
 
         // Önce binary cache'i dene (daha hızlı yükleme)
         if std::path::Path::new(&bin_path).exists() {
-            if let Ok(meta) = std::fs::metadata(&bin_path) {
-                let size_mb = meta.len() as f64 / 1_048_576.0;
-                print!("   {} cache yükleniyor ({:.1} MB)... ", name, size_mb);
-                let _ = std::io::stdout().flush();
-            }
+            let size_mb = std::fs::metadata(&bin_path)
+                .map(|m| m.len() as f64 / 1_048_576.0)
+                .unwrap_or(0.0);
+            
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{spinner:.cyan} {msg}")
+                    .unwrap()
+            );
+            pb.set_message(format!("{} cache yükleniyor ({:.1} MB)...", name, size_mb));
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
             
             if let Ok(f) = File::open(&bin_path) {
                 match bincode::deserialize_from(BufReader::new(f)) {
                     Ok(data) => {
-                        println!("✓");
+                        pb.finish_with_message(format!("✅ {} cache yüklendi ({:.1} MB)", name, size_mb));
                         return data;
                     }
                     Err(e) => {
-                        println!("✗");
-                        eprintln!("   ⚠️  Cache dosyası bozuk: {}", e);
+                        pb.finish_with_message(format!("❌ {} cache bozuk: {}", name, e));
                         let _ = std::fs::remove_file(&bin_path);
                     }
                 }
             }
         }
 
-        // JSON'dan yükle
-        let json = &json_path;
-        if let Ok(meta) = std::fs::metadata(json) {
-            let size_mb = meta.len() as f64 / 1_048_576.0;
-            if size_mb > 10.0 {
-                println!("   {} JSON yükleniyor ({:.1} MB) - bu biraz sürebilir...", name, size_mb);
-            } else {
-                print!("   {} JSON yükleniyor... ", name);
-                let _ = std::io::stdout().flush();
-            }
+        // JSON dosyası var mı kontrol et
+        if !std::path::Path::new(&json_path).exists() {
+            return (h20, h32);
         }
+
+        let size_mb = std::fs::metadata(&json_path)
+            .map(|m| m.len() as f64 / 1_048_576.0)
+            .unwrap_or(0.0);
+
+        // JSON parse için spinner
+        let parse_pb = ProgressBar::new_spinner();
+        parse_pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.yellow} {msg}")
+                .unwrap()
+        );
+        parse_pb.set_message(format!("{} JSON parse ediliyor ({:.1} MB)...", name, size_mb));
+        parse_pb.enable_steady_tick(std::time::Duration::from_millis(100));
         
-        if let Ok(f) = File::open(&json) {
-            let data: TargetFile = match serde_json::from_reader(BufReader::new(f)) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("⚠️  JSON parse hatası ({}): {}", json, e);
-                    return (h20, h32);
-                }
-            };
+        let f = match File::open(&json_path) {
+            Ok(f) => f,
+            Err(_) => {
+                parse_pb.finish_with_message(format!("❌ {} dosyası açılamadı", name));
+                return (h20, h32);
+            }
+        };
+        
+        let data: TargetFile = match serde_json::from_reader(BufReader::new(f)) {
+            Ok(d) => {
+                parse_pb.finish_and_clear();
+                d
+            }
+            Err(e) => {
+                parse_pb.finish_with_message(format!("❌ {} JSON hatası: {}", name, e));
+                return (h20, h32);
+            }
+        };
+        
+        let total = data.addresses.len() as u64;
+        
+        // Adres işleme için progress bar
+        let pb = ProgressBar::new(total);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("   {spinner:.green} [{bar:30.cyan/blue}] {pos}/{len} {msg}")
+                .unwrap()
+                .progress_chars("█▓░")
+        );
+        pb.set_message(format!("{} adresleri işleniyor", name));
+        
+        for (i, raw_addr) in data.addresses.into_iter().enumerate() {
+            if i % 10_000 == 0 {
+                pb.set_position(i as u64);
+            }
             
-            let total = data.addresses.len();
-            let mut processed = 0;
-            let show_progress = total > 100_000;
+            let a = raw_addr.trim();
+            if a.is_empty() {
+                continue;
+            }
             
-            for raw_addr in data.addresses {
-                processed += 1;
-                if show_progress && processed % 500_000 == 0 {
-                    println!("   ... {}/{} adres işlendi", processed, total);
-                }
-                // Whitespace temizliği
-                let a = raw_addr.trim();
-                if a.is_empty() {
-                    continue;
-                }
-                
-                match name {
-                    "bitcoin" => {
-                        if a.starts_with("bc1") {
-                            // Bech32: Native SegWit (bc1q) veya Taproot (bc1p)
-                            if let Ok((_, _, p)) = bech32::segwit::decode(a) {
-                                if let Ok(arr) = <[u8; 20]>::try_from(p.as_slice()) {
-                                    h20.insert(arr); // bc1q - Native SegWit
-                                } else if let Ok(arr) = <[u8; 32]>::try_from(p.as_slice()) {
-                                    h32.insert(arr); // bc1p - Taproot
-                                }
-                            }
-                        } else if let Ok(d) = bs58::decode(a).with_check(None).into_vec() {
-                            // Base58Check: Legacy (1...) veya P2SH (3...)
-                            // Format: 1 byte version + 20 byte hash = 21 byte minimum
-                            if d.len() >= 21 {
-                                if let Ok(arr) = <[u8; 20]>::try_from(&d[1..21]) {
-                                    h20.insert(arr);
-                                }
+            match name {
+                "bitcoin" => {
+                    if a.starts_with("bc1") {
+                        if let Ok((_, _, p)) = bech32::segwit::decode(a) {
+                            if let Ok(arr) = <[u8; 20]>::try_from(p.as_slice()) {
+                                h20.insert(arr);
+                            } else if let Ok(arr) = <[u8; 32]>::try_from(p.as_slice()) {
+                                h32.insert(arr);
                             }
                         }
-                    }
-                    "ethereum" => {
-                        if let Ok(b) = hex::decode(a.trim_start_matches("0x")) {
-                            if let Ok(arr) = <[u8; 20]>::try_from(b.as_slice()) {
+                    } else if let Ok(d) = bs58::decode(a).with_check(None).into_vec() {
+                        if d.len() >= 21 {
+                            if let Ok(arr) = <[u8; 20]>::try_from(&d[1..21]) {
                                 h20.insert(arr);
                             }
                         }
                     }
-                    "solana" => {
-                        if let Ok(b) = bs58::decode(a).into_vec() {
-                            if let Ok(arr) = <[u8; 32]>::try_from(b.as_slice()) {
-                                h32.insert(arr);
-                            }
-                        }
-                    }
-                    _ => {}
                 }
-            }
-            println!("   ✓ {} adres yüklendi", h20.len() + h32.len());
-            
-            // Binary cache oluştur (sonraki çalıştırmalar için)
-            if !h20.is_empty() || !h32.is_empty() {
-                print!("   💾 Cache oluşturuluyor... ");
-                let _ = std::io::stdout().flush();
-                if let Ok(cache) = File::create(&bin_path) {
-                    if bincode::serialize_into(cache, &(&h20, &h32)).is_ok() {
-                        if let Ok(meta) = std::fs::metadata(&bin_path) {
-                            let size_mb = meta.len() as f64 / 1_048_576.0;
-                            println!("✓ ({:.1} MB)", size_mb);
-                        } else {
-                            println!("✓");
+                "ethereum" => {
+                    if let Ok(b) = hex::decode(a.trim_start_matches("0x")) {
+                        if let Ok(arr) = <[u8; 20]>::try_from(b.as_slice()) {
+                            h20.insert(arr);
                         }
                     }
+                }
+                "solana" => {
+                    if let Ok(b) = bs58::decode(a).into_vec() {
+                        if let Ok(arr) = <[u8; 32]>::try_from(b.as_slice()) {
+                            h32.insert(arr);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        let loaded = h20.len() + h32.len();
+        pb.finish_with_message(format!("✅ {} adres yüklendi", loaded));
+        
+        // Binary cache oluştur
+        if loaded > 0 {
+            let cache_pb = ProgressBar::new_spinner();
+            cache_pb.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{spinner:.magenta} {msg}")
+                    .unwrap()
+            );
+            cache_pb.set_message(format!("{} cache oluşturuluyor...", name));
+            cache_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            
+            if let Ok(cache) = File::create(&bin_path) {
+                if bincode::serialize_into(cache, &(&h20, &h32)).is_ok() {
+                    let cache_size = std::fs::metadata(&bin_path)
+                        .map(|m| m.len() as f64 / 1_048_576.0)
+                        .unwrap_or(0.0);
+                    cache_pb.finish_with_message(format!("💾 {} cache oluşturuldu ({:.1} MB)", name, cache_size));
                 }
             }
         }
+        
         (h20, h32)
     }
 }
