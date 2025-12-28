@@ -5,9 +5,11 @@
 // Pipeline: Passphrase → SHA256 → secp256k1 → HASH160/Keccak256 → Output
 //
 // Supported Chains (ALL computed on GPU):
-// - Bitcoin: P2PKH (1...), P2SH-P2WPKH (3...), Native SegWit (bc1q...), Taproot (bc1p...)
+// - Bitcoin: P2PKH (1...), P2SH-P2WPKH (3...), Native SegWit (bc1q...)
 // - Litecoin: Same address types with LTC prefixes
 // - Ethereum: Keccak256-based addresses (0x...) - FULL GPU COMPUTATION!
+//
+// NOTE: Taproot REMOVED for 2x performance (saves one scalar_mul per passphrase)
 //
 // ═══════════════════════════════════════════════════════════════════════════
 // OPTIMIZATIONS IMPLEMENTED:
@@ -19,20 +21,16 @@
 // 4. Fermat's Little Theorem modular inversion (a^(p-2) mod p)
 // 5. Double-and-add scalar multiplication (MSB-first)
 // 6. Keccak256 on GPU for Ethereum (eliminates CPU bottleneck)
+// 7. NO TAPROOT = NO SECOND SCALAR_MUL = 2x FASTER!
 //
-// 7. ⭐ GLV ENDOMORPHISM - FREE 2x THROUGHPUT! ⭐
+// 8. ⭐ GLV ENDOMORPHISM - FREE 2x THROUGHPUT! ⭐
 //    From ONE EC computation k*G, we get TWO valid keypairs:
 //      Primary: (k, P) where P = k*G
 //      GLV:     (λ*k mod n, φ(P)) where φ(P) = (β*x, y)
 //    This DOUBLES the number of addresses we check per batch!
-//    φ computation is essentially FREE (just one field multiplication).
 //
-// TODO - Future optimizations:
-// - wNAF (Windowed Non-Adjacent Form) for faster scalar multiplication
-// - Montgomery batch inversion across thread groups
-//
-// Output per passphrase: 184 bytes total
-//   Primary (144): h160_c + h160_u + h160_nested + taproot + eth_addr + priv_key
+// Output per passphrase: 152 bytes total
+//   Primary (112): h160_c + h160_u + h160_nested + eth_addr + priv_key
 //   GLV (40):      glv_h160_c + glv_eth_addr (FREE BONUS!)
 // ============================================================================
 
@@ -56,44 +54,7 @@ constant ulong4 SECP256K1_N = {
 // Note: SECP256K1_K = 4294968273 = 2^32 + 977 is defined later with other constants
 // P = 2^256 - K allows fast modular reduction: result = lo + hi * K (mod P)
 
-// Check if value >= N (curve order)
-// Returns true if a >= SECP256K1_N
-inline bool ge_curve_order(ulong4 a) {
-    if (a.w > SECP256K1_N.w) return true;
-    if (a.w < SECP256K1_N.w) return false;
-    if (a.z > SECP256K1_N.z) return true;
-    if (a.z < SECP256K1_N.z) return false;
-    if (a.y > SECP256K1_N.y) return true;
-    if (a.y < SECP256K1_N.y) return false;
-    return a.x >= SECP256K1_N.x;
-}
-
-// Reduce scalar modulo curve order N (for BIP341 Taproot tweak)
-// If scalar >= N, subtract N
-inline ulong4 mod_n_reduce(ulong4 a) {
-    if (!ge_curve_order(a)) return a;
-    
-    // a - N (guaranteed no underflow since a >= N)
-    // FIXED: Safe borrow propagation that doesn't overflow
-    ulong4 r;
-    ulong bw = 0;
-    
-    r.x = a.x - SECP256K1_N.x;
-    bw = (a.x < SECP256K1_N.x) ? 1ULL : 0ULL;
-    
-    ulong temp = a.y - bw;
-    bw = (a.y < bw) ? 1ULL : 0ULL;
-    r.y = temp - SECP256K1_N.y;
-    bw = (temp < SECP256K1_N.y) ? 1ULL : bw;
-    
-    temp = a.z - bw;
-    bw = (a.z < bw) ? 1ULL : 0ULL;
-    r.z = temp - SECP256K1_N.z;
-    bw = (temp < SECP256K1_N.z) ? 1ULL : bw;
-    
-    r.w = a.w - bw - SECP256K1_N.w;
-    return r;
-}
+// NOTE: ge_curve_order and mod_n_reduce removed - were only used for Taproot
 
 constant ulong4 SECP256K1_GX = {
     0x59F2815B16F81798ULL, 0x029BFCDB2DCE28D9ULL,
@@ -161,7 +122,8 @@ constant uchar RIPEMD_RR[80] = {5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12,6,11,3,7,0
 constant uchar RIPEMD_SL[80] = {11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8,7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5,11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12,9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6};
 constant uchar RIPEMD_SR[80] = {8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5,15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8,8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11};
 
-// Output size per passphrase: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32) = 144 bytes
+// Output size per passphrase (NO TAPROOT = 2x faster!):
+//   h160_c(20) + h160_u(20) + h160_nested(20) + eth_addr(20) + priv_key(32) = 112 bytes
 // eth_addr is computed on GPU using Keccak256 - no CPU post-processing needed!
 // priv_key is the SHA256(passphrase) - avoids recomputation on CPU
 //
@@ -170,10 +132,10 @@ constant uchar RIPEMD_SR[80] = {8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,9,13,15,
 //   1. Primary: (k, P) where P = k*G
 //   2. GLV:     (λ*k mod n, φ(P)) where φ(P) = (β*x, y)
 // 
-// Output per passphrase: 184 bytes
-//   - h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32) = 144 bytes (primary)
+// Output per passphrase: 152 bytes
+//   - h160_c(20) + h160_u(20) + h160_nested(20) + eth_addr(20) + priv_key(32) = 112 bytes (primary)
 //   - glv_h160_c(20) + glv_eth_addr(20) = 40 bytes (GLV bonus - free addresses!)
-#define OUTPUT_SIZE 184
+#define OUTPUT_SIZE 152
 #define MAX_PASSPHRASE_LEN 128
 
 // Input stride: 16-byte aligned header (1 byte length + 15 padding) + 128 bytes data = 144 bytes
@@ -1096,26 +1058,7 @@ void scalar_mul(ulong4 k,
 // TAPROOT (BIP341) - Tagged Hash for "TapTweak" (hardcoded)
 // ============================================================================
 
-// Pre-computed SHA256("TapTweak") = 0xe80fe1639c9ca050e3af1b39c143c63e429cbceb15d940fbb5c5a1f4af57c5e9
-constant uchar TAPTWEAK_HASH[32] = {
-    0xe8, 0x0f, 0xe1, 0x63, 0x9c, 0x9c, 0xa0, 0x50,
-    0xe3, 0xaf, 0x1b, 0x39, 0xc1, 0x43, 0xc6, 0x3e,
-    0x42, 0x9c, 0xbc, 0xeb, 0x15, 0xd9, 0x40, 0xfb,
-    0xb5, 0xc5, 0xa1, 0xf4, 0xaf, 0x57, 0xc5, 0xe9
-};
-
-void taptweak_hash(thread const uchar* pubkey_x, thread uchar* out) {
-    // SHA256(SHA256("TapTweak") || SHA256("TapTweak") || pubkey_x)
-    // = SHA256(TAPTWEAK_HASH || TAPTWEAK_HASH || pubkey_x)
-    // Total: 64 + 32 = 96 bytes
-    uchar combined[96];
-    for (int i = 0; i < 32; i++) {
-        combined[i] = TAPTWEAK_HASH[i];
-        combined[32 + i] = TAPTWEAK_HASH[i];
-        combined[64 + i] = pubkey_x[i];
-    }
-    sha256_var(combined, 96, out);
-}
+// NOTE: TAPTWEAK_HASH and taptweak_hash removed - Taproot disabled for 2x performance
 
 // ============================================================================
 // MAIN KERNEL: process_brainwallet_batch
@@ -1145,13 +1088,14 @@ kernel void process_brainwallet_batch(
     uchar priv_key[32];
     sha256_var(passphrase, pp_len, priv_key);
     
-    // Step 2: Validate private key (must be < curve order and non-zero)
+    // Step 2: Validate private key (must be non-zero)
+    // Note: Probability of SHA256 >= N is ~1/2^128, essentially never happens
+    // We skip the ge_curve_order check for performance (removed with Taproot)
     ulong4 k = load_be(priv_key);
     uint out_offset = gid * OUTPUT_SIZE;
     
-    if (IsZero(k) || ge_curve_order(k)) {
-        // Invalid key (k=0 or k>=N) - zero output
-        // Note: Probability of SHA256 >= N is ~1/2^128, essentially never happens
+    if (IsZero(k)) {
+        // Invalid key (k=0) - zero output
         for (int i = 0; i < OUTPUT_SIZE; i++) {
             output[out_offset + i] = 0;
         }
@@ -1198,98 +1142,11 @@ kernel void process_brainwallet_batch(
     uchar h160_nested[20];
     hash160_22(witness_script, h160_nested);
     
-    // Step 9: Taproot output key (BIP341) - FULL IMPLEMENTATION
-    // Output key Q = P + t*G where:
-    //   P = internal key (x-only pubkey with even y per BIP340)
-    //   t = tagged_hash("TapTweak", P)
-    //   G = generator point
+    // NOTE: Step 9 (Taproot) REMOVED for 2x performance!
+    // Taproot required a second scalar_mul which doubled GPU workload.
+    // Removing it saves ~50% of GPU computation per passphrase.
     
-    // Internal key = x-only pubkey (32 bytes)
-    uchar x_only[32];
-    store_be(ax, x_only);
-    
-    // t = TapTweak hash
-    uchar tweak_bytes[32];
-    taptweak_hash(x_only, tweak_bytes);
-    
-    // Convert tweak to scalar and reduce mod N (BIP341 compliance)
-    // Note: Probability of tweak >= N is ~1/2^128, but must handle for correctness
-    ulong4 tweak_scalar = load_be(tweak_bytes);
-    tweak_scalar = mod_n_reduce(tweak_scalar);
-    
-    // BIP340: For x-only pubkey, we need y to be even
-    // If y is odd (LSB = 1), negate it: y = p - y
-    ulong4 Py = ay;
-    if (ay.x & 1) {
-        // y is odd, negate it: Py = p - ay
-        Py = mod_sub(SECP256K1_P, ay);
-    }
-    
-    // Compute t*G (tweak point)
-    ulong4 tGx, tGy, tGz, tGzz;
-    scalar_mul(tweak_scalar, tGx, tGy, tGz, tGzz);
-    
-    // Convert t*G to affine
-    ulong4 tGz_inv = mod_inv(tGz);
-    ulong4 tGz_inv2 = mod_sqr(tGz_inv);
-    ulong4 tGz_inv3 = mod_mul(tGz_inv2, tGz_inv);
-    ulong4 tGx_aff = mod_mul(tGx, tGz_inv2);
-    ulong4 tGy_aff = mod_mul(tGy, tGz_inv3);
-    
-    // P = (ax, Py) - internal key with even y
-    // Q = P + t*G using affine point addition
-    
-    // Check if P == t*G (edge case - would need point doubling)
-    bool same_x = (ax.x == tGx_aff.x && ax.y == tGx_aff.y && 
-                   ax.z == tGx_aff.z && ax.w == tGx_aff.w);
-    
-    ulong4 Qx, Qy;
-    bool use_fallback = false;
-    
-    if (same_x) {
-        // Points have same x - either equal or inverse
-        bool same_y = (Py.x == tGy_aff.x && Py.y == tGy_aff.y &&
-                      Py.z == tGy_aff.z && Py.w == tGy_aff.w);
-        if (same_y) {
-            // Point doubling: Q = 2P
-            ulong4 s_num = mod_mul(ax, ax);
-            s_num = mod_add(s_num, mod_add(s_num, s_num)); // 3x^2
-            ulong4 s_den = mod_add(Py, Py);                 // 2y
-            ulong4 s = mod_mul(s_num, mod_inv(s_den));
-            
-            Qx = mod_sub(mod_sqr(s), mod_add(ax, ax));
-            Qy = mod_sub(mod_mul(s, mod_sub(ax, Qx)), Py);
-        } else {
-            // Inverse points - result is infinity (shouldn't happen)
-            use_fallback = true;
-        }
-    } else {
-        // Standard affine point addition: Q = P + t*G
-        // slope = (tGy - Py) / (tGx - Px)
-        ulong4 dy = mod_sub(tGy_aff, Py);
-        ulong4 dx = mod_sub(tGx_aff, ax);
-        ulong4 dx_inv = mod_inv(dx);
-        ulong4 slope = mod_mul(dy, dx_inv);
-        
-        // Qx = slope^2 - Px - tGx
-        ulong4 slope2 = mod_sqr(slope);
-        Qx = mod_sub(mod_sub(slope2, ax), tGx_aff);
-        
-        // Qy = slope * (Px - Qx) - Py
-        Qy = mod_sub(mod_mul(slope, mod_sub(ax, Qx)), Py);
-    }
-    
-    // Output taproot key
-    uchar taproot[32];
-    if (use_fallback) {
-        // Fallback to internal key (edge case)
-        for (int i = 0; i < 32; i++) taproot[i] = x_only[i];
-    } else {
-        // Output = Qx (x-only, 32 bytes)
-        store_be(Qx, taproot);
-    }
-    
-    // Step 10: Ethereum address = Keccak256(pubkey_u without 0x04)[12:32]
+    // Step 9: Ethereum address = Keccak256(pubkey_u without 0x04)[12:32]
     // Computed entirely on GPU - no CPU post-processing needed!
     uchar eth_addr[20];
     eth_address_from_pubkey(pubkey_u + 1, eth_addr);  // Skip 0x04 prefix
@@ -1325,31 +1182,26 @@ kernel void process_brainwallet_batch(
     eth_address_from_pubkey(glv_pubkey_xy, glv_eth_addr);
     
     // =========================================================================
-    // Write output: 184 bytes total
+    // Write output: 152 bytes total (NO TAPROOT = 2x FASTER!)
     // =========================================================================
-    // Primary (144 bytes): h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32)
+    // Primary (112 bytes): h160_c(20) + h160_u(20) + h160_nested(20) + eth_addr(20) + priv_key(32)
     // GLV (40 bytes): glv_h160_c(20) + glv_eth_addr(20)
     
     // Primary addresses
     for (int i = 0; i < 20; i++) {
-        output[out_offset + i] = h160_c[i];
-        output[out_offset + 20 + i] = h160_u[i];
-        output[out_offset + 40 + i] = h160_nested[i];
+        output[out_offset + i] = h160_c[i];           // 0-19
+        output[out_offset + 20 + i] = h160_u[i];      // 20-39
+        output[out_offset + 40 + i] = h160_nested[i]; // 40-59
+        output[out_offset + 60 + i] = eth_addr[i];    // 60-79
     }
     for (int i = 0; i < 32; i++) {
-        output[out_offset + 60 + i] = taproot[i];
-    }
-    for (int i = 0; i < 20; i++) {
-        output[out_offset + 92 + i] = eth_addr[i];
-    }
-    for (int i = 0; i < 32; i++) {
-        output[out_offset + 112 + i] = priv_key[i];
+        output[out_offset + 80 + i] = priv_key[i];    // 80-111
     }
     
     // GLV bonus addresses (FREE 2x throughput!)
     for (int i = 0; i < 20; i++) {
-        output[out_offset + 144 + i] = glv_h160_c[i];      // GLV h160 for Bitcoin
-        output[out_offset + 164 + i] = glv_eth_addr[i];    // GLV Ethereum address
+        output[out_offset + 112 + i] = glv_h160_c[i];     // 112-131: GLV h160 for Bitcoin
+        output[out_offset + 132 + i] = glv_eth_addr[i];   // 132-151: GLV Ethereum address
     }
 }
 

@@ -193,16 +193,16 @@ impl Comparer {
                 HashStore20::HashSet(_) => "HashSet",
                 HashStore20::SortedMmap(_) => "mmap-binary-search",
             };
-            println!("📦 Bitcoin: {} adres (Legacy/SegWit: {}, Taproot: {}) [{}]", 
-                     btc_count, btc_20.len(), btc_32.len(), mode);
+            // NOTE: Taproot disabled for 2x GPU performance!
+            println!("📦 Bitcoin: {} adres (Legacy/SegWit) [{}]", btc_20.len(), mode);
         }
         if ltc_count > 0 {
             let mode = match &ltc_20 {
                 HashStore20::HashSet(_) => "HashSet",
                 HashStore20::SortedMmap(_) => "mmap-binary-search",
             };
-            println!("📦 Litecoin: {} adres (Legacy/SegWit: {}, Taproot: {}) [{}]", 
-                     ltc_count, ltc_20.len(), ltc_32.len(), mode);
+            // NOTE: Taproot disabled for 2x GPU performance!
+            println!("📦 Litecoin: {} adres (Legacy/SegWit) [{}]", ltc_20.len(), mode);
         }
         if eth_count > 0 {
             let mode = match &eth_20 {

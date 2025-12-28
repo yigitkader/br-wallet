@@ -6,10 +6,15 @@
 //! ## Performance Architecture
 //!
 //! The key optimization is **zero-allocation matching**:
-//! - GPU returns raw bytes (184 bytes per passphrase, including GLV bonus)
+//! - GPU returns raw bytes (152 bytes per passphrase, including GLV bonus)
 //! - We iterate over raw bytes without allocating BrainwalletResult for each
 //! - Only when a match is found do we allocate and copy data
 //! - This eliminates millions of heap allocations per second
+//!
+//! ## NO TAPROOT = 2x FASTER!
+//!
+//! Taproot required a second scalar_mul operation per passphrase.
+//! By removing it, we've doubled GPU throughput!
 //!
 //! ## GLV Endomorphism (FREE 2x THROUGHPUT!)
 //!
@@ -27,6 +32,8 @@ use super::gpu::{GpuBrainwallet, OUTPUT_SIZE};
 /// 
 /// ⚠️ PERFORMANCE: This struct is only created when a hash matches.
 /// For the 99.99%+ non-matching passphrases, we use zero-copy RawGpuResult.
+/// 
+/// NOTE: Taproot removed for 2x GPU performance!
 #[derive(Clone, Debug)]
 pub struct BrainwalletResult {
     /// Original passphrase (used in format functions)
@@ -38,8 +45,6 @@ pub struct BrainwalletResult {
     pub h160_u: [u8; 20],
     /// HASH160(P2SH-P2WPKH script) - for Nested SegWit
     pub h160_nested: [u8; 20],
-    /// Taproot x-only pubkey (32 bytes)
-    pub taproot: [u8; 32],
     /// Ethereum address (20 bytes) - Keccak256(pubkey)[12:32]
     pub eth_addr: [u8; 20],
     /// Private key (32 bytes) - SHA256(passphrase)
@@ -63,8 +68,8 @@ impl BrainwalletResult {
 /// Zero-copy view into GPU output for a single passphrase
 /// 
 /// This is used for efficient matching without heap allocation.
-/// Layout: Primary(144) + GLV(40) = 184 bytes
-///   Primary: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32)
+/// Layout: Primary(112) + GLV(40) = 152 bytes (NO TAPROOT = 2x FASTER!)
+///   Primary: h160_c(20) + h160_u(20) + h160_nested(20) + eth_addr(20) + priv_key(32)
 ///   GLV: glv_h160_c(20) + glv_eth_addr(20)
 #[derive(Clone, Copy)]
 pub struct RawGpuResult<'a> {
@@ -88,56 +93,50 @@ impl<'a> RawGpuResult<'a> {
         self.data[..20].iter().any(|&b| b != 0)
     }
     
-    /// Get h160_c (compressed pubkey hash) - zero-copy
+    /// Get h160_c (compressed pubkey hash) - zero-copy [0..20]
     #[inline]
     pub fn h160_c(&self) -> &[u8; 20] {
         self.data[0..20].try_into().unwrap()
     }
     
-    /// Get h160_u (uncompressed pubkey hash) - zero-copy
+    /// Get h160_u (uncompressed pubkey hash) - zero-copy [20..40]
     #[inline]
     pub fn h160_u(&self) -> &[u8; 20] {
         self.data[20..40].try_into().unwrap()
     }
     
-    /// Get h160_nested (P2SH-P2WPKH) - zero-copy
+    /// Get h160_nested (P2SH-P2WPKH) - zero-copy [40..60]
     #[inline]
     pub fn h160_nested(&self) -> &[u8; 20] {
         self.data[40..60].try_into().unwrap()
     }
     
-    /// Get taproot pubkey - zero-copy
+    /// Get Ethereum address - zero-copy [60..80]
     #[inline]
-    pub fn taproot(&self) -> &[u8; 32] {
-        self.data[60..92].try_into().unwrap()
+    pub fn eth_addr(&self) -> &[u8; 20] {
+        self.data[60..80].try_into().unwrap()
+    }
+    
+    /// Get private key - zero-copy [80..112]
+    #[inline]
+    pub fn priv_key(&self) -> &[u8; 32] {
+        self.data[80..112].try_into().unwrap()
     }
     
     // =========================================================================
     // GLV Endomorphism accessors (FREE 2x throughput!)
     // =========================================================================
     
-    /// Get GLV h160_c (compressed GLV pubkey hash) - zero-copy
+    /// Get GLV h160_c (compressed GLV pubkey hash) - zero-copy [112..132]
     #[inline]
     pub fn glv_h160_c(&self) -> &[u8; 20] {
-        self.data[144..164].try_into().unwrap()
+        self.data[112..132].try_into().unwrap()
     }
     
-    /// Get GLV Ethereum address - zero-copy
+    /// Get GLV Ethereum address - zero-copy [132..152]
     #[inline]
     pub fn glv_eth_addr(&self) -> &[u8; 20] {
-        self.data[164..184].try_into().unwrap()
-    }
-    
-    /// Get Ethereum address - zero-copy
-    #[inline]
-    pub fn eth_addr(&self) -> &[u8; 20] {
-        self.data[92..112].try_into().unwrap()
-    }
-    
-    /// Get private key - zero-copy
-    #[inline]
-    pub fn priv_key(&self) -> &[u8; 32] {
-        self.data[112..144].try_into().unwrap()
+        self.data[132..152].try_into().unwrap()
     }
     
     /// Convert to owned BrainwalletResult (allocates!)
@@ -149,7 +148,6 @@ impl<'a> RawGpuResult<'a> {
             h160_c: *self.h160_c(),
             h160_u: *self.h160_u(),
             h160_nested: *self.h160_nested(),
-            taproot: *self.taproot(),
             eth_addr: *self.eth_addr(),
             priv_key: *self.priv_key(),
             glv_h160_c: *self.glv_h160_c(),
@@ -256,7 +254,6 @@ impl BatchProcessor {
                 h160_c: gpu_result.h160_c,
                 h160_u: gpu_result.h160_u,
                 h160_nested: gpu_result.h160_nested,
-                taproot: gpu_result.taproot,
                 eth_addr: gpu_result.eth_addr,
                 priv_key: gpu_result.priv_key,
                 glv_h160_c: gpu_result.glv_h160_c,
@@ -447,24 +444,23 @@ mod tests {
     #[test]
     fn test_raw_gpu_result_zero_copy() {
         // Test that RawGpuResult doesn't allocate
-        // Layout: Primary(144) + GLV(40) = 184 bytes
+        // Layout: Primary(112) + GLV(40) = 152 bytes (NO TAPROOT!)
         let data = [0u8; OUTPUT_SIZE];
         let raw = RawGpuResult::new(&data).unwrap();
         
         // These should all be zero-copy references
-        // Primary
-        assert_eq!(raw.h160_c().len(), 20);
-        assert_eq!(raw.h160_u().len(), 20);
-        assert_eq!(raw.h160_nested().len(), 20);
-        assert_eq!(raw.taproot().len(), 32);
-        assert_eq!(raw.eth_addr().len(), 20);
-        assert_eq!(raw.priv_key().len(), 32);
+        // Primary (112 bytes)
+        assert_eq!(raw.h160_c().len(), 20);       // 0-19
+        assert_eq!(raw.h160_u().len(), 20);       // 20-39
+        assert_eq!(raw.h160_nested().len(), 20);  // 40-59
+        assert_eq!(raw.eth_addr().len(), 20);     // 60-79
+        assert_eq!(raw.priv_key().len(), 32);     // 80-111
         
-        // GLV bonus (FREE 2x throughput!)
-        assert_eq!(raw.glv_h160_c().len(), 20);
-        assert_eq!(raw.glv_eth_addr().len(), 20);
+        // GLV bonus (40 bytes - FREE 2x throughput!)
+        assert_eq!(raw.glv_h160_c().len(), 20);   // 112-131
+        assert_eq!(raw.glv_eth_addr().len(), 20); // 132-151
         
-        // Total should be 184
+        // Total should be 152 (NO TAPROOT = 2x FASTER!)
         assert!(!raw.is_valid()); // all zeros
     }
 }

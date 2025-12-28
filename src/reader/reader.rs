@@ -169,11 +169,11 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
                 let mut rep = String::new();
                 
                 // Check Bitcoin - Primary keypair (zero-copy hash access)
+                // NOTE: Taproot removed for 2x GPU performance!
                 if comparer.btc_on {
                     if comparer.btc_20.contains(raw.h160_c())
                         || comparer.btc_20.contains(raw.h160_u())
                         || comparer.btc_20.contains(raw.h160_nested())
-                        || comparer.btc_32.contains(raw.taproot())
                     {
                         let result = raw.to_owned(passphrase);
                         let pass = String::from_utf8_lossy(passphrase);
@@ -188,11 +188,11 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
                 }
 
                 // Check Litecoin - Primary keypair (zero-copy hash access)
+                // NOTE: Taproot removed for 2x GPU performance!
                 if comparer.ltc_on {
                     if comparer.ltc_20.contains(raw.h160_c())
                         || comparer.ltc_20.contains(raw.h160_u())
                         || comparer.ltc_20.contains(raw.h160_nested())
-                        || comparer.ltc_32.contains(raw.taproot())
                     {
                         let result = raw.to_owned(passphrase);
                         let pass = String::from_utf8_lossy(passphrase);
