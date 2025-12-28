@@ -179,6 +179,25 @@ pub struct GpuBrainwallet {
 unsafe impl Send for GpuBrainwallet {}
 unsafe impl Sync for GpuBrainwallet {}
 
+/// Thread-safe wrapper for raw pointer address (used in parallel copy)
+/// Stores as usize to make it Send+Sync safe
+#[derive(Clone, Copy)]
+struct PtrAddr(usize);
+unsafe impl Send for PtrAddr {}
+unsafe impl Sync for PtrAddr {}
+
+impl PtrAddr {
+    #[inline]
+    fn new(ptr: *mut u8) -> Self {
+        Self(ptr as usize)
+    }
+    
+    #[inline]
+    fn get(&self) -> *mut u8 {
+        self.0 as *mut u8
+    }
+}
+
 impl GpuBrainwallet {
     /// Create a new GPU brainwallet processor
     pub fn new() -> Result<Self, String> {
@@ -363,7 +382,11 @@ impl GpuBrainwallet {
     /// Returns a direct slice into the GPU output buffer.
     /// This is the most efficient method - no heap allocation.
     /// Data is valid until the next call to any process method.
+    /// 
+    /// PERFORMANCE: Uses parallel copy via rayon for large batches (>1024)
     pub fn process_batch_raw(&self, passphrases: &[&[u8]]) -> Result<&[u8], String> {
+        use rayon::prelude::*;
+        
         if passphrases.is_empty() {
             return Ok(&[]);
         }
@@ -371,23 +394,54 @@ impl GpuBrainwallet {
         let count = passphrases.len().min(self.tier.threads_per_dispatch);
         
         // Copy passphrases to input buffer with 16-byte aligned header
+        // PARALLEL COPY for large batches to avoid CPU bottleneck
         unsafe {
             let input_ptr = self.input_buffer.contents() as *mut u8;
             
-            for (i, passphrase) in passphrases.iter().take(count).enumerate() {
-                let offset = i * PASSPHRASE_STRIDE;
-                let len = passphrase.len().min(MAX_PASSPHRASE_LEN);
+            // For batches > 1024, use parallel copy via rayon
+            // This significantly speeds up buffer preparation for large batch sizes
+            if count > 1024 {
+                // Store pointer address as usize for thread safety
+                let ptr_addr = PtrAddr::new(input_ptr);
                 
-                // Length byte + 15 bytes padding + data
-                *input_ptr.add(offset) = len as u8;
-                std::ptr::write_bytes(input_ptr.add(offset + 1), 0, 15);
-                std::ptr::copy_nonoverlapping(
-                    passphrase.as_ptr(),
-                    input_ptr.add(offset + 16),
-                    len,
-                );
-                
-                // NOTE: No padding needed - shader uses pp_len to determine read length
+                // Each thread writes to its own non-overlapping region (STRIDE * i)
+                // This is safe because regions don't overlap
+                passphrases.par_iter()
+                    .take(count)
+                    .enumerate()
+                    .for_each(move |(i, passphrase)| {
+                        let offset = i * PASSPHRASE_STRIDE;
+                        let len = passphrase.len().min(MAX_PASSPHRASE_LEN);
+                        
+                        let ptr = ptr_addr.get();
+                        
+                        // Length byte at offset 0
+                        *ptr.add(offset) = len as u8;
+                        
+                        // Zero padding bytes 1-15
+                        std::ptr::write_bytes(ptr.add(offset + 1), 0, 15);
+                        
+                        // Copy passphrase data starting at byte 16
+                        std::ptr::copy_nonoverlapping(
+                            passphrase.as_ptr(),
+                            ptr.add(offset + 16),
+                            len,
+                        );
+                    });
+            } else {
+                // Sequential copy for small batches (overhead not worth it)
+                for (i, passphrase) in passphrases.iter().take(count).enumerate() {
+                    let offset = i * PASSPHRASE_STRIDE;
+                    let len = passphrase.len().min(MAX_PASSPHRASE_LEN);
+                    
+                    *input_ptr.add(offset) = len as u8;
+                    std::ptr::write_bytes(input_ptr.add(offset + 1), 0, 15);
+                    std::ptr::copy_nonoverlapping(
+                        passphrase.as_ptr(),
+                        input_ptr.add(offset + 16),
+                        len,
+                    );
+                }
             }
             
             let count_ptr = self.count_buffer.contents() as *mut u32;

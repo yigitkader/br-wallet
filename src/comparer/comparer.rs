@@ -482,6 +482,15 @@ impl Comparer {
                         .map(|m| m.len() as f64 / 1_048_576.0)
                         .unwrap_or(0.0);
                     cache_pb.finish_with_message(format!("💾 {} cache oluşturuldu ({:.1} MB)", name, cache_size));
+                    
+                    // ⚠️ CRITICAL FIX: For large datasets, immediately reload from cache
+                    // to use zero-copy SortedMmap instead of RAM-heavy HashSet!
+                    // This prevents ~10GB RAM usage for 150M+ addresses.
+                    if loaded >= LARGE_DATASET_THRESHOLD {
+                        if let Some(stores) = Self::load_from_cache(&bin_path) {
+                            return stores;
+                        }
+                    }
                 }
                 Err(e) => {
                     cache_pb.finish_with_message(format!("⚠️  {} cache yazılamadı: {}", name, e));
@@ -489,6 +498,7 @@ impl Comparer {
             }
         }
         
+        // For small datasets, HashSet is faster (O(1) vs O(log n))
         (HashStore20::HashSet(h20), HashStore32::HashSet(h32))
     }
 }
