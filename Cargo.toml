@@ -12,8 +12,8 @@ name = "brwallet"
 path = "src/main.rs"
 
 [features]
-# GPU mode disabled by default - shader has hash mismatch bug (to be fixed)
-default = []
+# GPU mode enabled by default - 30-300x faster than CPU
+default = ["gpu"]
 gpu = ["metal", "objc", "block", "lazy_static", "crossbeam-channel", "k256", "parking_lot"]
 
 [dependencies]

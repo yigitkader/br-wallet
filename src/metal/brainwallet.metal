@@ -615,8 +615,12 @@ inline void ext_jac_add_affine(ulong4 X1, ulong4 Y1, ulong4 Z1, ulong4 ZZ1,
 }
 
 // ============================================================================
-// SCALAR MULTIPLICATION (Double-and-Add)
+// SCALAR MULTIPLICATION (Double-and-Add) - FIXED
 // ============================================================================
+//
+// FIX: Corrected word processing order from LSB→MSB to MSB→LSB
+// This matches the standard double-and-add algorithm for scalar multiplication
+//
 
 void scalar_mul(ulong4 k, 
                 thread ulong4& out_X, thread ulong4& out_Y,
@@ -631,9 +635,11 @@ void scalar_mul(ulong4 k,
     ulong4 Gx = SECP256K1_GX;
     ulong4 Gy = SECP256K1_GY;
     
-    // Process each bit of k (256 bits = 4 * 64)
-    for (int word = 0; word < 4; word++) {
-        ulong bits = (word == 0) ? k.x : ((word == 1) ? k.y : ((word == 2) ? k.z : k.w));
+    // FIXED: Process words from MSB to LSB (word 3 → 2 → 1 → 0)
+    for (int word = 3; word >= 0; word--) {
+        ulong bits = (word == 3) ? k.w : 
+                     ((word == 2) ? k.z : 
+                     ((word == 1) ? k.y : k.x));
         
         for (int bit = 0; bit < 64; bit++) {
             // Double
