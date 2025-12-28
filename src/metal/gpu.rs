@@ -84,20 +84,25 @@ impl GpuTier {
         println!("[GPU] Device: {}", name);
         println!("[GPU] Recommended working set: {} MB", gpu_mem_mb);
         
+        // Detect Apple Silicon
+        let is_apple_silicon = name_lower.contains("apple");
+        
         // Determine tier based on GPU capabilities
-        let threads = if name_lower.contains("ultra") || gpu_mem_mb >= 96000 {
-            println!("[GPU] ULTRA tier detected");
-            262_144
-        } else if name_lower.contains("max") || gpu_mem_mb >= 48000 {
-            println!("[GPU] MAX tier detected");
-            131_072
-        } else if name_lower.contains("pro") || gpu_mem_mb >= 16000 {
-            println!("[GPU] PRO tier detected");
-            65_536
+        // Thresholds adjusted for accurate Apple Silicon detection
+        let (tier_name, threads) = if name_lower.contains("ultra") || gpu_mem_mb >= 80000 {
+            ("ULTRA", 262_144)
+        } else if name_lower.contains("max") || gpu_mem_mb >= 40000 {
+            ("MAX", 131_072)
+        } else if name_lower.contains("pro") || (is_apple_silicon && gpu_mem_mb >= 18000) {
+            ("PRO", 65_536)
+        } else if is_apple_silicon && gpu_mem_mb >= 8000 {
+            // M1/M2 base chips have ~10-11GB working set
+            ("M1/M2", 49_152)
         } else {
-            println!("[GPU] BASE tier detected");
-            32_768
+            ("BASE", 32_768)
         };
+        
+        println!("[GPU] {} tier detected", tier_name);
         
         Ok(Self {
             name,

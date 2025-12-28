@@ -13,11 +13,30 @@ use std::sync::{
 #[cfg(feature = "gpu")]
 use crate::metal::{BatchProcessor, BrainwalletResult, PassphraseBatcher};
 
-/// Ortalama satır uzunluğunu tahmin ederek satır sayısını hesaplar (çift taramadan kaçınır)
-fn estimate_line_count(file_size: u64) -> u64 {
-    // Tipik rockyou.txt ortalama satır uzunluğu ~9 karakter + newline
-    const AVG_LINE_LENGTH: u64 = 10;
-    file_size / AVG_LINE_LENGTH
+/// Örnek taramayla satır sayısını tahmin eder (daha doğru)
+/// 
+/// İlk 1MB'ı tarayarak ortalama satır uzunluğunu hesaplar,
+/// sonra dosya boyutuna göre toplam satır sayısını tahmin eder.
+fn estimate_line_count(mmap: &Mmap) -> u64 {
+    const SAMPLE_SIZE: usize = 1_048_576; // 1 MB
+    
+    let sample_len = SAMPLE_SIZE.min(mmap.len());
+    if sample_len == 0 {
+        return 0;
+    }
+    
+    let sample = &mmap[..sample_len];
+    let sample_lines = sample.iter().filter(|&&b| b == b'\n').count();
+    
+    if sample_lines == 0 {
+        // Fallback: tek satırlık dosya veya \n yok
+        return if mmap.len() > 0 { 1 } else { 0 };
+    }
+    
+    // Ortalama satır uzunluğu = örnek boyut / örnek satır sayısı
+    // Toplam tahmin = dosya boyutu / ortalama satır uzunluğu
+    let total_lines = (mmap.len() as u64 * sample_lines as u64) / sample_len as u64;
+    total_lines
 }
 
 /// Satır temizleme: CRLF/LF ve leading/trailing whitespace
@@ -72,7 +91,6 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
 fn try_gpu_cracking(dict: &str, comparer: &Comparer) -> Result<(), String> {
     
     let file = std::fs::File::open(dict).map_err(|e| e.to_string())?;
-    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
     
     // Initialize GPU processor
@@ -90,7 +108,8 @@ fn try_gpu_cracking(dict: &str, comparer: &Comparer) -> Result<(), String> {
             .map_err(|e| e.to_string())?,
     ));
     
-    let estimated_lines = estimate_line_count(file_size);
+    let estimated_lines = estimate_line_count(&mmap);
+    println!("📊 Tahmini satır sayısı: {}", estimated_lines);
     let pb = ProgressBar::new(estimated_lines);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -266,7 +285,6 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
 /// CPU implementation of cracking
 fn start_cracking_cpu(dict: &str, comparer: &Comparer) {
     let file = std::fs::File::open(dict).expect("Dict missing");
-    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
     
     // Memory-mapped file yükle
     let mmap = unsafe { Mmap::map(&file).unwrap() };
@@ -280,8 +298,9 @@ fn start_cracking_cpu(dict: &str, comparer: &Comparer) {
             .unwrap(),
     ));
 
-    // Çift tarama yerine tahmini satır sayısı kullan
-    let estimated_lines = estimate_line_count(file_size);
+    // Örnek taramayla gerçek satır sayısı tahmini
+    let estimated_lines = estimate_line_count(&mmap);
+    println!("📊 Tahmini satır sayısı: {}", estimated_lines);
     let pb = ProgressBar::new(estimated_lines);
     pb.set_style(
         ProgressStyle::default_bar()
