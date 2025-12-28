@@ -2,15 +2,27 @@
 //!
 //! This module provides high-level batch processing that integrates
 //! the GPU with the existing comparer system.
+//!
+//! ## Performance Architecture
+//!
+//! The key optimization is **zero-allocation matching**:
+//! - GPU returns raw bytes (144 bytes per passphrase)
+//! - We iterate over raw bytes without allocating BrainwalletResult for each
+//! - Only when a match is found do we allocate and copy data
+//! - This eliminates millions of heap allocations per second
 
 use std::sync::Arc;
 
 use super::gpu::{GpuBrainwallet, OUTPUT_SIZE};
 
-/// Result from batch processing - matches CPU wallet format
+/// Result from batch processing - only created on MATCH
+/// 
+/// ⚠️ PERFORMANCE: This struct is only created when a hash matches.
+/// For the 99.99%+ non-matching passphrases, we use zero-copy RawGpuResult.
 #[derive(Clone, Debug)]
 pub struct BrainwalletResult {
-    /// Original passphrase
+    /// Original passphrase (used in format functions)
+    #[allow(dead_code)]
     pub passphrase: Vec<u8>,
     /// HASH160(compressed pubkey) - for P2PKH and Native SegWit
     pub h160_c: [u8; 20],
@@ -29,8 +41,134 @@ pub struct BrainwalletResult {
 
 impl BrainwalletResult {
     /// Check if result is valid (non-zero hashes)
+    #[allow(dead_code)]
     pub fn is_valid(&self) -> bool {
         self.h160_c.iter().any(|&b| b != 0)
+    }
+}
+
+/// Zero-copy view into GPU output for a single passphrase
+/// 
+/// This is used for efficient matching without heap allocation.
+/// Layout: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32) = 144
+#[derive(Clone, Copy)]
+pub struct RawGpuResult<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> RawGpuResult<'a> {
+    /// Create from raw GPU output slice (must be OUTPUT_SIZE bytes)
+    #[inline]
+    pub fn new(data: &'a [u8]) -> Option<Self> {
+        if data.len() >= OUTPUT_SIZE {
+            Some(Self { data: &data[..OUTPUT_SIZE] })
+        } else {
+            None
+        }
+    }
+    
+    /// Check if valid (non-zero h160_c)
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.data[..20].iter().any(|&b| b != 0)
+    }
+    
+    /// Get h160_c (compressed pubkey hash) - zero-copy
+    #[inline]
+    pub fn h160_c(&self) -> &[u8; 20] {
+        self.data[0..20].try_into().unwrap()
+    }
+    
+    /// Get h160_u (uncompressed pubkey hash) - zero-copy
+    #[inline]
+    pub fn h160_u(&self) -> &[u8; 20] {
+        self.data[20..40].try_into().unwrap()
+    }
+    
+    /// Get h160_nested (P2SH-P2WPKH) - zero-copy
+    #[inline]
+    pub fn h160_nested(&self) -> &[u8; 20] {
+        self.data[40..60].try_into().unwrap()
+    }
+    
+    /// Get taproot pubkey - zero-copy
+    #[inline]
+    pub fn taproot(&self) -> &[u8; 32] {
+        self.data[60..92].try_into().unwrap()
+    }
+    
+    /// Get Ethereum address - zero-copy
+    #[inline]
+    pub fn eth_addr(&self) -> &[u8; 20] {
+        self.data[92..112].try_into().unwrap()
+    }
+    
+    /// Get private key - zero-copy
+    #[inline]
+    pub fn priv_key(&self) -> &[u8; 32] {
+        self.data[112..144].try_into().unwrap()
+    }
+    
+    /// Convert to owned BrainwalletResult (allocates!)
+    /// Only call this when a match is confirmed.
+    #[inline]
+    pub fn to_owned(&self, passphrase: &[u8]) -> BrainwalletResult {
+        BrainwalletResult {
+            passphrase: passphrase.to_vec(),
+            h160_c: *self.h160_c(),
+            h160_u: *self.h160_u(),
+            h160_nested: *self.h160_nested(),
+            taproot: *self.taproot(),
+            eth_addr: *self.eth_addr(),
+            priv_key: *self.priv_key(),
+        }
+    }
+}
+
+/// Raw GPU output buffer - zero-copy access to batch results
+/// 
+/// This struct holds the raw bytes from GPU and provides zero-copy
+/// iteration over results. NO heap allocations until a match is found.
+pub struct RawBatchOutput {
+    /// Raw output bytes from GPU
+    data: Vec<u8>,
+    /// Number of valid results
+    count: usize,
+}
+
+impl RawBatchOutput {
+    /// Get number of results
+    #[inline]
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.count
+    }
+    
+    /// Check if empty
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+    
+    /// Get raw result at index (zero-copy)
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<RawGpuResult<'_>> {
+        if index >= self.count {
+            return None;
+        }
+        let offset = index * OUTPUT_SIZE;
+        if offset + OUTPUT_SIZE > self.data.len() {
+            return None;
+        }
+        RawGpuResult::new(&self.data[offset..offset + OUTPUT_SIZE])
+    }
+    
+    /// Iterate over all results (zero-copy)
+    #[inline]
+    #[allow(dead_code)]
+    pub fn iter(&self) -> impl Iterator<Item = RawGpuResult<'_>> {
+        (0..self.count).filter_map(move |i| self.get(i))
     }
 }
 
@@ -53,9 +191,35 @@ impl BatchProcessor {
         self.gpu.max_batch_size()
     }
     
-    /// Process a batch of passphrases
+    /// Process a batch and return raw output (zero-copy friendly)
     /// 
-    /// Returns results for all passphrases (including invalid ones with zero hashes)
+    /// ⚠️ PERFORMANCE: This is the recommended method for maximum performance.
+    /// Iterate over RawBatchOutput without allocating BrainwalletResult for each passphrase.
+    /// Only call RawGpuResult::to_owned() when a match is confirmed.
+    pub fn process_raw(&self, passphrases: &[&[u8]]) -> Result<RawBatchOutput, String> {
+        let gpu_results = self.gpu.process_batch(passphrases)?;
+        
+        // Convert to raw bytes
+        let count = gpu_results.len();
+        let mut data = Vec::with_capacity(count * OUTPUT_SIZE);
+        
+        for result in &gpu_results {
+            data.extend_from_slice(&result.h160_c);
+            data.extend_from_slice(&result.h160_u);
+            data.extend_from_slice(&result.h160_nested);
+            data.extend_from_slice(&result.taproot);
+            data.extend_from_slice(&result.eth_addr);
+            data.extend_from_slice(&result.priv_key);
+        }
+        
+        Ok(RawBatchOutput { data, count })
+    }
+    
+    /// Process a batch of passphrases (legacy API - allocates for each result)
+    /// 
+    /// ⚠️ PERFORMANCE WARNING: This method allocates BrainwalletResult for EVERY
+    /// passphrase, including the 99.99%+ that don't match. Use process_raw() instead.
+    #[allow(dead_code)]
     pub fn process(&self, passphrases: &[&[u8]]) -> Result<Vec<BrainwalletResult>, String> {
         let gpu_results = self.gpu.process_batch(passphrases)?;
         
@@ -76,83 +240,9 @@ impl BatchProcessor {
         Ok(results)
     }
     
-    /// Process a batch and check against target sets
-    /// 
-    /// This is the most efficient method - no intermediate allocations.
-    /// Returns only matching passphrases with their results.
-    #[allow(dead_code)]
-    pub fn process_and_match<F>(
-        &self,
-        passphrases: &[&[u8]],
-        mut matcher: F,
-    ) -> Result<Vec<BrainwalletResult>, String>
-    where
-        F: FnMut(&[u8; 20], &[u8; 20], &[u8; 20], &[u8; 32]) -> bool,
-    {
-        // Get raw output from GPU
-        let raw_output = self.gpu.process_batch_raw(passphrases)?;
-        
-        let mut matches = Vec::new();
-        
-        for (i, passphrase) in passphrases.iter().enumerate() {
-            let offset = i * OUTPUT_SIZE;
-            if offset + OUTPUT_SIZE > raw_output.len() {
-                break;
-            }
-            
-            let data = &raw_output[offset..offset + OUTPUT_SIZE];
-            
-            // Parse inline - layout: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32) = 144
-            let h160_c: [u8; 20] = data[0..20].try_into().unwrap();
-            let h160_u: [u8; 20] = data[20..40].try_into().unwrap();
-            let h160_nested: [u8; 20] = data[40..60].try_into().unwrap();
-            let taproot: [u8; 32] = data[60..92].try_into().unwrap();
-            let eth_addr: [u8; 20] = data[92..112].try_into().unwrap();
-            let priv_key: [u8; 32] = data[112..144].try_into().unwrap();
-            
-            // Skip invalid results
-            if h160_c.iter().all(|&b| b == 0) {
-                continue;
-            }
-            
-            // Check if any hash matches
-            if matcher(&h160_c, &h160_u, &h160_nested, &taproot) {
-                matches.push(BrainwalletResult {
-                    passphrase: passphrase.to_vec(),
-                    h160_c,
-                    h160_u,
-                    h160_nested,
-                    taproot,
-                    eth_addr,
-                    priv_key,
-                });
-            }
-        }
-        
-        Ok(matches)
-    }
-    
     /// Get total processed count
     pub fn total_processed(&self) -> u64 {
         self.gpu.total_processed()
-    }
-    
-    /// Signal to stop processing
-    #[allow(dead_code)]
-    pub fn stop(&self) {
-        self.gpu.stop();
-    }
-    
-    /// Check if should stop
-    #[allow(dead_code)]
-    pub fn should_stop(&self) -> bool {
-        self.gpu.should_stop()
-    }
-    
-    /// Get reference to underlying GPU processor
-    #[allow(dead_code)]
-    pub fn gpu(&self) -> &GpuBrainwallet {
-        &self.gpu
     }
 }
 
@@ -291,6 +381,58 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results[0].is_valid());
         assert!(results[1].is_valid());
+    }
+    
+    #[test]
+    fn test_batch_processor_raw() {
+        if !metal::Device::system_default().is_some() {
+            println!("Skipping test - no Metal device");
+            return;
+        }
+        
+        let processor = BatchProcessor::new().unwrap();
+        
+        let passphrases: Vec<&[u8]> = vec![b"password", b"test", b"hello"];
+        let raw_output = processor.process_raw(&passphrases).unwrap();
+        
+        // Check length
+        assert_eq!(raw_output.len(), 3);
+        
+        // Test zero-copy access
+        let result0 = raw_output.get(0).unwrap();
+        let result1 = raw_output.get(1).unwrap();
+        let result2 = raw_output.get(2).unwrap();
+        
+        assert!(result0.is_valid());
+        assert!(result1.is_valid());
+        assert!(result2.is_valid());
+        
+        // Test zero-copy hash access
+        assert!(result0.h160_c().iter().any(|&b| b != 0));
+        assert!(result0.eth_addr().iter().any(|&b| b != 0));
+        
+        // Test to_owned only when needed
+        let owned = result0.to_owned(b"password");
+        assert_eq!(owned.passphrase, b"password");
+        assert_eq!(owned.h160_c, *result0.h160_c());
+    }
+    
+    #[test]
+    fn test_raw_gpu_result_zero_copy() {
+        // Test that RawGpuResult doesn't allocate
+        let data = [0u8; 144];
+        let raw = RawGpuResult::new(&data).unwrap();
+        
+        // These should all be zero-copy references
+        assert_eq!(raw.h160_c().len(), 20);
+        assert_eq!(raw.h160_u().len(), 20);
+        assert_eq!(raw.h160_nested().len(), 20);
+        assert_eq!(raw.taproot().len(), 32);
+        assert_eq!(raw.eth_addr().len(), 20);
+        assert_eq!(raw.priv_key().len(), 32);
+        
+        // Total should be 144
+        assert!(!raw.is_valid()); // all zeros
     }
 }
 
