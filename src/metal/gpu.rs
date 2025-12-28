@@ -23,58 +23,9 @@ pub const OUTPUT_SIZE: usize = 152;
 pub const MAX_PASSPHRASE_LEN: usize = 128;
 pub const PASSPHRASE_STRIDE: usize = 16 + MAX_PASSPHRASE_LEN;
 
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct GpuBrainwalletResult {
-    pub h160_c: [u8; 20],
-    pub h160_u: [u8; 20],
-    pub h160_nested: [u8; 20],
-    pub eth_addr: [u8; 20],
-    pub priv_key: [u8; 32],
-    pub glv_h160_c: [u8; 20],
-    pub glv_eth_addr: [u8; 20],
-}
-
-impl GpuBrainwalletResult {
-    #[inline]
-    pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < OUTPUT_SIZE {
-            return None;
-        }
-        
-        let mut result = Self {
-            h160_c: [0u8; 20],
-            h160_u: [0u8; 20],
-            h160_nested: [0u8; 20],
-            eth_addr: [0u8; 20],
-            priv_key: [0u8; 32],
-            glv_h160_c: [0u8; 20],
-            glv_eth_addr: [0u8; 20],
-        };
-        
-        result.h160_c.copy_from_slice(&data[0..20]);
-        result.h160_u.copy_from_slice(&data[20..40]);
-        result.h160_nested.copy_from_slice(&data[40..60]);
-        result.eth_addr.copy_from_slice(&data[60..80]);
-        result.priv_key.copy_from_slice(&data[80..112]);
-        result.glv_h160_c.copy_from_slice(&data[112..132]);
-        result.glv_eth_addr.copy_from_slice(&data[132..152]);
-        
-        Some(result)
-    }
-    
-    #[inline]
-    #[allow(dead_code)]
-    pub fn is_valid(&self) -> bool {
-        self.h160_c.iter().any(|&b| b != 0)
-    }
-}
-
 /// GPU tier configuration based on hardware
 #[derive(Clone)]
-#[allow(dead_code)]
 struct GpuTier {
-    name: String,
     threads_per_dispatch: usize,
     threadgroup_size: usize,
 }
@@ -109,16 +60,19 @@ impl GpuTier {
         println!("[GPU] {} tier detected", tier_name);
         
         Ok(Self {
-            name,
             threads_per_dispatch: threads,
             threadgroup_size: 256,
         })
     }
 }
 
-/// GPU Brainwallet processor
-#[allow(dead_code)]
+/// GPU Brainwallet processor - Apple Metal accelerated
+/// 
+/// Processes passphrases in batches, computing SHA256 → secp256k1 → HASH160/Keccak256
+/// entirely on GPU for maximum throughput.
 pub struct GpuBrainwallet {
+    /// Metal device (kept alive for buffer/pipeline lifetime)
+    #[allow(dead_code)]
     device: Device,
     pipeline: ComputePipelineState,
     queue: CommandQueue,
@@ -214,125 +168,6 @@ impl GpuBrainwallet {
     /// Get maximum batch size
     pub fn max_batch_size(&self) -> usize {
         self.tier.threads_per_dispatch
-    }
-    
-    /// Process a batch of passphrases
-    /// 
-    /// Returns a vector of results, one per passphrase.
-    /// Invalid passphrases (empty or producing invalid keys) have all-zero results.
-    pub fn process_batch(&self, passphrases: &[&[u8]]) -> Result<Vec<GpuBrainwalletResult>, String> {
-        if passphrases.is_empty() {
-            return Ok(Vec::new());
-        }
-        
-        let count = passphrases.len().min(self.tier.threads_per_dispatch);
-        
-        // NOTE: Output buffer zeroing removed - shader writes to entire area
-        // Stale data would only affect results beyond 'count' which are never read
-        
-        // Copy passphrases to input buffer with 16-byte aligned header
-        // Format: [length:1][padding:15][data:128] = 144 bytes per passphrase
-        unsafe {
-            let input_ptr = self.input_buffer.contents() as *mut u8;
-            
-            for (i, passphrase) in passphrases.iter().take(count).enumerate() {
-                let offset = i * PASSPHRASE_STRIDE;
-                let len = passphrase.len().min(MAX_PASSPHRASE_LEN);
-                
-                // Write length byte at offset 0
-                *input_ptr.add(offset) = len as u8;
-                
-                // Zero the 15-byte padding (bytes 1-15)
-                std::ptr::write_bytes(input_ptr.add(offset + 1), 0, 15);
-                
-                // Write passphrase data starting at byte 16 (16-byte aligned)
-                std::ptr::copy_nonoverlapping(
-                    passphrase.as_ptr(),
-                    input_ptr.add(offset + 16),
-                    len,
-                );
-                
-                // NOTE: No padding needed - shader uses pp_len to determine read length
-                // Metal buffers don't require explicit zeroing for unused regions
-            }
-            
-            // Write count
-            let count_ptr = self.count_buffer.contents() as *mut u32;
-            *count_ptr = count as u32;
-        }
-        
-        // Dispatch GPU kernel
-        let command_buffer = self.queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-        
-        encoder.set_compute_pipeline_state(&self.pipeline);
-        encoder.set_buffer(0, Some(&self.input_buffer), 0);
-        encoder.set_buffer(1, Some(&self.count_buffer), 0);
-        encoder.set_buffer(2, Some(&self.output_buffer), 0);
-        
-        let grid_size = MTLSize::new(count as u64, 1, 1);
-        let threadgroup_size = MTLSize::new(self.tier.threadgroup_size as u64, 1, 1);
-        
-        encoder.dispatch_threads(grid_size, threadgroup_size);
-        encoder.end_encoding();
-        
-        command_buffer.commit();
-        
-        // Wait with timeout to prevent infinite blocking
-        let deadline = Instant::now() + GPU_TIMEOUT;
-        loop {
-            let status = command_buffer.status();
-            match status {
-                metal::MTLCommandBufferStatus::Completed => break,
-                metal::MTLCommandBufferStatus::Error => {
-                    return Err(format!(
-                        "GPU command buffer failed (status: {:?}). \
-                         Possible causes: shader error, buffer overflow, or invalid data.",
-                        status
-                    ));
-                }
-                _ => {
-                    if Instant::now() > deadline {
-                        return Err(format!(
-                            "GPU timeout after {:?}. The GPU may be overloaded or the batch too large.",
-                            GPU_TIMEOUT
-                        ));
-                    }
-                    thread::sleep(GPU_POLL_INTERVAL);
-                }
-            }
-        }
-        
-        // Read results
-        let mut results = Vec::with_capacity(count);
-        
-        unsafe {
-            let output_ptr = self.output_buffer.contents() as *const u8;
-            
-            for i in 0..count {
-                let offset = i * OUTPUT_SIZE;
-                let data = std::slice::from_raw_parts(output_ptr.add(offset), OUTPUT_SIZE);
-                
-                if let Some(result) = GpuBrainwalletResult::from_bytes(data) {
-                    results.push(result);
-                } else {
-                    // Should never happen, but handle gracefully
-                    results.push(GpuBrainwalletResult {
-                        h160_c: [0u8; 20],
-                        h160_u: [0u8; 20],
-                        h160_nested: [0u8; 20],
-                        eth_addr: [0u8; 20],
-                        priv_key: [0u8; 32],
-                        glv_h160_c: [0u8; 20],
-                        glv_eth_addr: [0u8; 20],
-                    });
-                }
-            }
-        }
-        
-        self.total_processed.fetch_add(count as u64, Ordering::Relaxed);
-        
-        Ok(results)
     }
     
     /// Process a batch and return raw bytes (TRUE zero-copy)
@@ -462,16 +297,25 @@ impl GpuBrainwallet {
         self.total_processed.load(Ordering::Relaxed)
     }
     
-    /// Signal to stop processing
-    #[allow(dead_code)]
+    /// Signal to stop processing (for graceful shutdown)
+    /// 
+    /// Sets the stop flag. Use `should_stop()` to check this flag
+    /// in your processing loop.
     pub fn stop(&self) {
         self.should_stop.store(true, Ordering::SeqCst);
     }
     
-    /// Check if should stop
-    #[allow(dead_code)]
+    /// Check if stop was signaled
+    /// 
+    /// Returns true if `stop()` was called. Use this to implement
+    /// graceful shutdown in your processing loop.
     pub fn should_stop(&self) -> bool {
         self.should_stop.load(Ordering::SeqCst)
+    }
+    
+    /// Reset the stop flag
+    pub fn reset_stop(&self) {
+        self.should_stop.store(false, Ordering::SeqCst);
     }
 }
 
@@ -488,7 +332,7 @@ mod tests {
     
     #[test]
     fn test_gpu_init() {
-        if !metal::Device::system_default().is_some() {
+        if metal::Device::system_default().is_none() {
             println!("Skipping test - no Metal device");
             return;
         }
@@ -498,8 +342,29 @@ mod tests {
     }
     
     #[test]
-    fn test_gpu_process_batch() {
-        if !metal::Device::system_default().is_some() {
+    fn test_gpu_stop_control() {
+        if metal::Device::system_default().is_none() {
+            println!("Skipping test - no Metal device");
+            return;
+        }
+        
+        let gpu = GpuBrainwallet::new().unwrap();
+        
+        // Initial state: not stopped
+        assert!(!gpu.should_stop());
+        
+        // Signal stop
+        gpu.stop();
+        assert!(gpu.should_stop());
+        
+        // Reset stop
+        gpu.reset_stop();
+        assert!(!gpu.should_stop());
+    }
+    
+    #[test]
+    fn test_gpu_process_batch_raw() {
+        if metal::Device::system_default().is_none() {
             println!("Skipping test - no Metal device");
             return;
         }
@@ -512,22 +377,29 @@ mod tests {
             b"hello world",
         ];
         
-        let results = gpu.process_batch(&passphrases).unwrap();
-        assert_eq!(results.len(), 3);
+        let raw_output = gpu.process_batch_raw(&passphrases).unwrap();
+        
+        // Should have 3 results, each OUTPUT_SIZE bytes
+        assert_eq!(raw_output.len(), 3 * OUTPUT_SIZE);
+        
+        // Check that results are different (h160_c is first 20 bytes)
+        let h160_0 = &raw_output[0..20];
+        let h160_1 = &raw_output[OUTPUT_SIZE..OUTPUT_SIZE + 20];
+        let h160_2 = &raw_output[2 * OUTPUT_SIZE..2 * OUTPUT_SIZE + 20];
         
         // All results should be valid (non-zero)
-        for result in &results {
-            assert!(result.is_valid(), "Result should be valid");
-        }
+        assert!(h160_0.iter().any(|&b| b != 0), "Result 0 should be valid");
+        assert!(h160_1.iter().any(|&b| b != 0), "Result 1 should be valid");
+        assert!(h160_2.iter().any(|&b| b != 0), "Result 2 should be valid");
         
         // Results should be different
-        assert_ne!(results[0].h160_c, results[1].h160_c);
-        assert_ne!(results[1].h160_c, results[2].h160_c);
+        assert_ne!(h160_0, h160_1);
+        assert_ne!(h160_1, h160_2);
     }
     
     #[test]
     fn test_gpu_known_vector() {
-        if !metal::Device::system_default().is_some() {
+        if metal::Device::system_default().is_none() {
             println!("Skipping test - no Metal device");
             return;
         }
@@ -536,13 +408,16 @@ mod tests {
         
         // Known test vector: SHA256("password") is a well-known private key
         let passphrases: Vec<&[u8]> = vec![b"password"];
-        let results = gpu.process_batch(&passphrases).unwrap();
+        let raw_output = gpu.process_batch_raw(&passphrases).unwrap();
         
-        assert_eq!(results.len(), 1);
-        assert!(results[0].is_valid());
+        assert_eq!(raw_output.len(), OUTPUT_SIZE);
         
-        println!("password -> h160_c: {}", hex::encode(&results[0].h160_c));
-        println!("password -> h160_u: {}", hex::encode(&results[0].h160_u));
+        // Result should be valid (non-zero h160_c)
+        let h160_c = &raw_output[0..20];
+        assert!(h160_c.iter().any(|&b| b != 0), "Result should be valid");
+        
+        println!("password -> h160_c: {}", hex::encode(h160_c));
+        println!("password -> h160_u: {}", hex::encode(&raw_output[20..40]));
     }
 }
 

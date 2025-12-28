@@ -6,21 +6,34 @@
 use std::sync::Arc;
 use super::gpu::{GpuBrainwallet, OUTPUT_SIZE};
 
+/// Result of brainwallet processing containing all derived addresses
 #[derive(Clone, Debug)]
 pub struct BrainwalletResult {
-    #[allow(dead_code)]
+    /// Original passphrase used to derive this result
     pub passphrase: Vec<u8>,
+    /// HASH160 of compressed public key (for P2PKH, SegWit)
     pub h160_c: [u8; 20],
+    /// Ethereum address (last 20 bytes of Keccak256)
     pub eth_addr: [u8; 20],
+    /// Private key (SHA256 of passphrase)
     pub priv_key: [u8; 32],
+    /// GLV-derived HASH160 of compressed public key
     pub glv_h160_c: [u8; 20],
+    /// GLV-derived Ethereum address
     pub glv_eth_addr: [u8; 20],
 }
 
 impl BrainwalletResult {
-    #[allow(dead_code)]
+    /// Check if result is valid (non-zero hash)
+    #[inline]
     pub fn is_valid(&self) -> bool {
         self.h160_c.iter().any(|&b| b != 0)
+    }
+    
+    /// Get passphrase as UTF-8 string (lossy conversion)
+    #[inline]
+    pub fn passphrase_str(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.passphrase)
     }
 }
 
@@ -94,24 +107,26 @@ impl<'a> RawGpuResult<'a> {
     }
 }
 
+/// Zero-copy batch output from GPU processing
 pub struct RawBatchOutput<'a> {
     data: &'a [u8],
     count: usize,
 }
 
 impl<'a> RawBatchOutput<'a> {
+    /// Number of results in this batch
     #[inline]
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.count
     }
     
+    /// Check if batch is empty
     #[inline]
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
     
+    /// Get result at index (zero-copy)
     #[inline]
     pub fn get(&self, index: usize) -> Option<RawGpuResult<'a>> {
         if index >= self.count {
@@ -124,8 +139,8 @@ impl<'a> RawBatchOutput<'a> {
         RawGpuResult::new(&self.data[offset..offset + OUTPUT_SIZE])
     }
     
+    /// Iterate over all results (zero-copy)
     #[inline]
-    #[allow(dead_code)]
     pub fn iter(&self) -> impl Iterator<Item = RawGpuResult<'a>> + '_ {
         (0..self.count).filter_map(move |i| self.get(i))
     }
@@ -151,20 +166,18 @@ impl BatchProcessor {
         Ok(RawBatchOutput { data: raw_data, count })
     }
     
-    #[allow(dead_code)]
+    /// Process batch and return full BrainwalletResult structs
+    /// 
+    /// Use `process_raw` for zero-allocation matching in hot paths.
+    /// This method is useful when you need the full result with passphrase.
     pub fn process(&self, passphrases: &[&[u8]]) -> Result<Vec<BrainwalletResult>, String> {
-        let gpu_results = self.gpu.process_batch(passphrases)?;
+        let raw_output = self.process_raw(passphrases)?;
         
-        let mut results = Vec::with_capacity(gpu_results.len());
-        for (passphrase, gpu_result) in passphrases.iter().zip(gpu_results.iter()) {
-            results.push(BrainwalletResult {
-                passphrase: passphrase.to_vec(),
-                h160_c: gpu_result.h160_c,
-                eth_addr: gpu_result.eth_addr,
-                priv_key: gpu_result.priv_key,
-                glv_h160_c: gpu_result.glv_h160_c,
-                glv_eth_addr: gpu_result.glv_eth_addr,
-            });
+        let mut results = Vec::with_capacity(raw_output.len());
+        for (i, passphrase) in passphrases.iter().enumerate() {
+            if let Some(raw) = raw_output.get(i) {
+                results.push(raw.to_owned(passphrase));
+            }
         }
         Ok(results)
     }
@@ -215,14 +228,27 @@ impl<'a> PassphraseBatcher<'a> {
         if batch.is_empty() { None } else { Some(batch) }
     }
     
-    #[allow(dead_code)]
+    /// Reset batcher to beginning
     pub fn reset(&mut self) {
         self.position = 0;
     }
     
-    #[allow(dead_code)]
+    /// Get current position in bytes
     pub fn position(&self) -> usize {
         self.position
+    }
+    
+    /// Get total data size in bytes
+    pub fn total_size(&self) -> usize {
+        self.data.len()
+    }
+    
+    /// Calculate progress as percentage (0.0 - 100.0)
+    pub fn progress_percent(&self) -> f64 {
+        if self.data.is_empty() {
+            return 100.0;
+        }
+        (self.position as f64 / self.data.len() as f64) * 100.0
     }
 }
 
@@ -259,8 +285,30 @@ mod tests {
     }
     
     #[test]
+    fn test_batcher_methods() {
+        let data = b"line1\nline2\nline3\n";
+        let mut batcher = PassphraseBatcher::new(data, 2);
+        
+        // Test total_size
+        assert_eq!(batcher.total_size(), data.len());
+        
+        // Initial position
+        assert_eq!(batcher.position(), 0);
+        assert!(batcher.progress_percent() < 0.01);
+        
+        // After first batch
+        let _ = batcher.next_batch();
+        assert!(batcher.position() > 0);
+        assert!(batcher.progress_percent() > 0.0);
+        
+        // Reset and verify
+        batcher.reset();
+        assert_eq!(batcher.position(), 0);
+    }
+    
+    #[test]
     fn test_batch_processor() {
-        if !metal::Device::system_default().is_some() {
+        if metal::Device::system_default().is_none() {
             return;
         }
         
@@ -270,6 +318,34 @@ mod tests {
         
         assert_eq!(results.len(), 2);
         assert!(results[0].is_valid());
+        
+        // Test passphrase_str
+        assert_eq!(results[0].passphrase_str(), "password");
+        assert_eq!(results[1].passphrase_str(), "test");
+    }
+    
+    #[test]
+    fn test_raw_batch_output() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        
+        let processor = BatchProcessor::new().unwrap();
+        let passphrases: Vec<&[u8]> = vec![b"test1", b"test2", b"test3"];
+        let raw_output = processor.process_raw(&passphrases).unwrap();
+        
+        // Test len/is_empty
+        assert_eq!(raw_output.len(), 3);
+        assert!(!raw_output.is_empty());
+        
+        // Test iter
+        let count = raw_output.iter().count();
+        assert_eq!(count, 3);
+        
+        // Verify all results are valid
+        for result in raw_output.iter() {
+            assert!(result.is_valid());
+        }
     }
     
     #[test]

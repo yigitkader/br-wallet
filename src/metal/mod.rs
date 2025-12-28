@@ -35,11 +35,15 @@
 mod gpu;
 pub mod batch;
 
-// GpuBrainwallet exposed for advanced usage
-#[allow(unused_imports)]
+// Re-export commonly used types for library consumers
+pub use batch::{BatchProcessor, BrainwalletResult, PassphraseBatcher};
+pub use batch::{RawBatchOutput, RawGpuResult};
+
+// Re-export GPU types for advanced users who need direct GPU access
 pub use gpu::GpuBrainwallet;
 
-pub use batch::{BatchProcessor, BrainwalletResult, PassphraseBatcher};
+// Constants for buffer sizing
+pub use gpu::{OUTPUT_SIZE, MAX_PASSPHRASE_LEN, PASSPHRASE_STRIDE};
 
 /// Check if Metal GPU is available on this system
 pub fn is_gpu_available() -> bool {
