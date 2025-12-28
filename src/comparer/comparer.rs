@@ -261,63 +261,34 @@ impl Comparer {
             match name {
                 "bitcoin" => {
                     if a.starts_with("bc1q") {
-                        // Native SegWit (P2WPKH)
                         if let Ok((_, _, p)) = bech32::segwit::decode(a) {
                             if let Ok(arr) = <[u8; 20]>::try_from(p.as_slice()) {
                                 h20.insert(arr);
                             }
                         }
-                    } else if a.starts_with('1') {
-                        // P2PKH (version 0x00)
-                        if let Ok(d) = bs58::decode(a).with_check(Some(0x00)).into_vec() {
-                            if d.len() >= 21 {
-                                if let Ok(arr) = <[u8; 20]>::try_from(&d[1..21]) {
-                                    h20.insert(arr);
-                                }
-                            }
-                        }
-                    } else if a.starts_with('3') {
-                        // P2SH (version 0x05)
-                        if let Ok(d) = bs58::decode(a).with_check(Some(0x05)).into_vec() {
-                            if d.len() >= 21 {
-                                if let Ok(arr) = <[u8; 20]>::try_from(&d[1..21]) {
-                                    h20.insert(arr);
-                                }
+                    } else if let Ok(d) = bs58::decode(a).with_check(None).into_vec() {
+                        // with_check(None) validates checksum, accepts any version byte
+                        if d.len() >= 21 {
+                            if let Ok(arr) = <[u8; 20]>::try_from(&d[1..21]) {
+                                h20.insert(arr);
                             }
                         }
                     }
-                    // Silently skip invalid/unsupported address formats
                 }
                 "litecoin" => {
                     if a.starts_with("ltc1q") {
-                        // Native SegWit (P2WPKH)
                         if let Ok((_, _, p)) = bech32::segwit::decode(a) {
                             if let Ok(arr) = <[u8; 20]>::try_from(p.as_slice()) {
                                 h20.insert(arr);
                             }
                         }
-                    } else if a.starts_with('L') || a.starts_with('M') {
-                        // P2PKH (version 0x30) - starts with L
-                        // P2SH (version 0x32) - starts with M
-                        let version = if a.starts_with('L') { 0x30 } else { 0x32 };
-                        if let Ok(d) = bs58::decode(a).with_check(Some(version)).into_vec() {
-                            if d.len() >= 21 {
-                                if let Ok(arr) = <[u8; 20]>::try_from(&d[1..21]) {
-                                    h20.insert(arr);
-                                }
-                            }
-                        }
-                    } else if a.starts_with('3') {
-                        // Legacy P2SH (version 0x05) - some old Litecoin addresses
-                        if let Ok(d) = bs58::decode(a).with_check(Some(0x05)).into_vec() {
-                            if d.len() >= 21 {
-                                if let Ok(arr) = <[u8; 20]>::try_from(&d[1..21]) {
-                                    h20.insert(arr);
-                                }
+                    } else if let Ok(d) = bs58::decode(a).with_check(None).into_vec() {
+                        if d.len() >= 21 {
+                            if let Ok(arr) = <[u8; 20]>::try_from(&d[1..21]) {
+                                h20.insert(arr);
                             }
                         }
                     }
-                    // Silently skip invalid/unsupported address formats
                 }
                 "ethereum" => {
                     if let Ok(b) = hex::decode(a.trim_start_matches("0x")) {
