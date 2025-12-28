@@ -109,8 +109,7 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
         if !rep.is_empty() {
             let mut f = log.lock().unwrap();
             let _ = f.write_all(rep.as_bytes());
-            // flush() kaldırıldı - BufWriter kendi buffer'ını yönetsin
-            // Program sonunda zaten flush ediliyor
+            let _ = f.flush(); // Anında diske yaz - veri kaybını önle
             pb.println(format!("\n{}", rep));
         }
 
