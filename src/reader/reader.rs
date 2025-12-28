@@ -13,30 +13,47 @@ use std::sync::{
 #[cfg(feature = "gpu")]
 use crate::metal::{BatchProcessor, BrainwalletResult, PassphraseBatcher};
 
-/// Örnek taramayla satır sayısını tahmin eder (daha doğru)
+/// Adaptive sampling ile satır sayısını tahmin eder
 /// 
-/// İlk 1MB'ı tarayarak ortalama satır uzunluğunu hesaplar,
-/// sonra dosya boyutuna göre toplam satır sayısını tahmin eder.
+/// Dosyanın 3 farklı bölgesinden (başlangıç, orta, son) örnek alarak
+/// daha doğru bir tahmin yapar. Değişken uzunluklu satırlar için önemli.
 fn estimate_line_count(mmap: &Mmap) -> u64 {
-    const SAMPLE_SIZE: usize = 1_048_576; // 1 MB
+    const SAMPLE_SIZE: usize = 1_048_576; // 1 MB per sample
     
-    let sample_len = SAMPLE_SIZE.min(mmap.len());
-    if sample_len == 0 {
+    if mmap.len() == 0 {
         return 0;
     }
     
-    let sample = &mmap[..sample_len];
-    let sample_lines = sample.iter().filter(|&&b| b == b'\n').count();
+    // 3 farklı bölgeden sample al: başlangıç, orta, son
+    let positions: [usize; 3] = [
+        0,                                          // Başlangıç
+        mmap.len() / 2,                            // Orta
+        mmap.len().saturating_sub(SAMPLE_SIZE),    // Son
+    ];
     
-    if sample_lines == 0 {
+    let mut total_lines = 0u64;
+    let mut total_bytes = 0usize;
+    
+    for &start in &positions {
+        let end = (start + SAMPLE_SIZE).min(mmap.len());
+        if end <= start {
+            continue;
+        }
+        
+        let sample = &mmap[start..end];
+        let lines = sample.iter().filter(|&&b| b == b'\n').count();
+        
+        total_lines += lines as u64;
+        total_bytes += sample.len();
+    }
+    
+    if total_lines == 0 {
         // Fallback: tek satırlık dosya veya \n yok
         return if mmap.len() > 0 { 1 } else { 0 };
     }
     
-    // Ortalama satır uzunluğu = örnek boyut / örnek satır sayısı
-    // Toplam tahmin = dosya boyutu / ortalama satır uzunluğu
-    let total_lines = (mmap.len() as u64 * sample_lines as u64) / sample_len as u64;
-    total_lines
+    // Toplam tahmin = dosya boyutu * (toplam satır / toplam örnek byte)
+    (mmap.len() as u64 * total_lines) / total_bytes as u64
 }
 
 /// Satır temizleme: CRLF/LF ve leading/trailing whitespace
@@ -156,8 +173,7 @@ fn try_gpu_cracking(dict: &str, comparer: &Comparer) -> Result<(), String> {
                         || comparer.ltc_20.contains(&result.h160_nested)
                         || comparer.ltc_32.contains(&result.taproot)
                     {
-                        // For LTC match, generate proper report
-                        rep.push_str(&format!("[LTC MATCH] passphrase: {}\n", pass));
+                        rep.push_str(&format_ltc_match(result, &pass));
                     }
                 }
                 
@@ -235,45 +251,91 @@ fn try_gpu_cracking(dict: &str, comparer: &Comparer) -> Result<(), String> {
     Ok(())
 }
 
-/// Format GPU match result
+/// Format GPU match result - uses GPU-computed hashes directly (NO secp256k1 re-computation!)
 #[cfg(feature = "gpu")]
-fn format_gpu_match(result: &BrainwalletResult, pass: &str, comparer: &Comparer) -> String {
+fn format_gpu_match(result: &BrainwalletResult, pass: &str, _comparer: &Comparer) -> String {
     use sha2::{Digest, Sha256};
     
-    // Recompute private key from passphrase
+    // Compute private key (just SHA256, no secp256k1)
     let priv_bytes: [u8; 32] = Sha256::digest(&result.passphrase).into();
     
-    let mut rep = String::new();
+    // Compute WIF (compressed) - only SHA256 double hash, no EC operations
+    let wif = compute_wif(&priv_bytes, 0x80, true);
     
-    // Check Bitcoin
-    if comparer.btc_on {
-        let btc_match = comparer.btc_20.contains(&result.h160_c)
-            || comparer.btc_20.contains(&result.h160_u)
-            || comparer.btc_20.contains(&result.h160_nested)
-            || comparer.btc_32.contains(&result.taproot);
-        
-        if btc_match {
-            if let Some(btc) = crate::brainwallet::BtcWallet::generate(priv_bytes) {
-                rep.push_str(&btc.get_report(pass));
-            }
-        }
+    // Build addresses from GPU-computed hashes (NO secp256k1!)
+    let hrp = bech32::Hrp::parse("bc").unwrap();
+    
+    format!(
+        "=== BITCOIN MATCH ===\n\
+         Passphrase: {}\n\
+         WIF: {}\n\
+         Legacy (1...):      {}\n\
+         Legacy Uncomp:      {}\n\
+         P2SH-SegWit (3...): {}\n\
+         Native SegWit:      {}\n\
+         Taproot:            {}\n\
+         =====================\n\n",
+        pass,
+        wif,
+        to_b58_static(0x00, &result.h160_c),
+        to_b58_static(0x00, &result.h160_u),
+        to_b58_static(0x05, &result.h160_nested),
+        bech32::segwit::encode(hrp, bech32::segwit::VERSION_0, &result.h160_c).unwrap_or_default(),
+        bech32::segwit::encode(hrp, bech32::segwit::VERSION_1, &result.taproot).unwrap_or_default(),
+    )
+}
+
+/// Compute WIF from private key bytes (only SHA256 double hash, no EC)
+#[cfg(feature = "gpu")]
+fn compute_wif(priv_bytes: &[u8; 32], version: u8, compressed: bool) -> String {
+    let mut wif_bytes = vec![version];
+    wif_bytes.extend_from_slice(priv_bytes);
+    if compressed {
+        wif_bytes.push(0x01);
     }
+    bs58::encode(&wif_bytes).with_check().into_string()
+}
+
+/// Base58Check encode with version byte
+#[cfg(feature = "gpu")]
+fn to_b58_static(version: u8, hash: &[u8; 20]) -> String {
+    let mut data = vec![version];
+    data.extend_from_slice(hash);
+    bs58::encode(&data).with_check().into_string()
+}
+
+/// Format LTC match result - uses GPU-computed hashes directly (NO secp256k1!)
+#[cfg(feature = "gpu")]
+fn format_ltc_match(result: &BrainwalletResult, pass: &str) -> String {
+    use sha2::{Digest, Sha256};
     
-    // Check Litecoin
-    if comparer.ltc_on {
-        let ltc_match = comparer.ltc_20.contains(&result.h160_c)
-            || comparer.ltc_20.contains(&result.h160_u)
-            || comparer.ltc_20.contains(&result.h160_nested)
-            || comparer.ltc_32.contains(&result.taproot);
-        
-        if ltc_match {
-            if let Some(ltc) = crate::brainwallet::LtcWallet::generate(priv_bytes) {
-                rep.push_str(&ltc.get_report(pass));
-            }
-        }
-    }
+    // Compute private key (just SHA256, no secp256k1)
+    let priv_bytes: [u8; 32] = Sha256::digest(&result.passphrase).into();
     
-    rep
+    // Compute WIF (Litecoin version byte 0xB0)
+    let wif = compute_wif(&priv_bytes, 0xB0, true);
+    
+    // Build addresses from GPU-computed hashes (Litecoin version bytes)
+    let hrp = bech32::Hrp::parse("ltc").unwrap();
+    
+    format!(
+        "=== LITECOIN MATCH ===\n\
+         Passphrase: {}\n\
+         WIF: {}\n\
+         Legacy (L...):      {}\n\
+         Legacy Uncomp:      {}\n\
+         P2SH-SegWit (M...): {}\n\
+         Native SegWit:      {}\n\
+         Taproot:            {}\n\
+         ======================\n\n",
+        pass,
+        wif,
+        to_b58_static(0x30, &result.h160_c),   // LTC P2PKH version
+        to_b58_static(0x30, &result.h160_u),
+        to_b58_static(0x32, &result.h160_nested), // LTC P2SH version
+        bech32::segwit::encode(hrp, bech32::segwit::VERSION_0, &result.h160_c).unwrap_or_default(),
+        bech32::segwit::encode(hrp, bech32::segwit::VERSION_1, &result.taproot).unwrap_or_default(),
+    )
 }
 
 /// CPU-only cracking (fallback or when gpu feature is disabled)
@@ -367,9 +429,9 @@ fn start_cracking_cpu(dict: &str, comparer: &Comparer) {
             pb.println(format!("\n{}", rep));
         }
 
-        // Progress bar güncelleme
+        // Progress bar güncelleme (her 10K satırda - GPU ile tutarlı)
         let current = counter.fetch_add(1, Ordering::Relaxed);
-        if current % 1_000 == 0 {
+        if current % 10_000 == 0 {
             pb.set_position(current);
         }
     });
