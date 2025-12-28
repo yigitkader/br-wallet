@@ -1,5 +1,18 @@
-use crate::brainwallet::MultiWallet;
+//! GPU-Accelerated Brainwallet Cracker - Metal Implementation
+//!
+//! This module provides high-performance brainwallet cracking using Apple Metal GPU.
+//! ALL cryptographic operations (SHA256, secp256k1, RIPEMD160, Keccak256) run on GPU.
+//!
+//! Supported chains:
+//! - Bitcoin: P2PKH, P2SH-P2WPKH, Native SegWit, Taproot
+//! - Litecoin: Same address types with LTC prefixes
+//! - Ethereum: Keccak256-based addresses
+//!
+//! ⚠️ GPU-ONLY: This implementation requires Apple Metal GPU.
+//! CPU fallback has been removed for maximum performance.
+
 use crate::comparer::Comparer;
+use crate::metal::{BatchProcessor, BrainwalletResult, PassphraseBatcher};
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -10,156 +23,152 @@ use std::sync::{
     Mutex,
 };
 
-#[cfg(feature = "gpu")]
-use crate::metal::{BatchProcessor, BrainwalletResult, PassphraseBatcher};
-
 /// Adaptive sampling ile satır sayısını tahmin eder
-/// 
+///
 /// Dosyanın 3 farklı bölgesinden (başlangıç, orta, son) örnek alarak
 /// daha doğru bir tahmin yapar. Değişken uzunluklu satırlar için önemli.
 fn estimate_line_count(mmap: &Mmap) -> u64 {
     const SAMPLE_SIZE: usize = 1_048_576; // 1 MB per sample
-    
+
     if mmap.len() == 0 {
         return 0;
     }
-    
+
     // 3 farklı bölgeden sample al: başlangıç, orta, son
     let positions: [usize; 3] = [
-        0,                                          // Başlangıç
-        mmap.len() / 2,                            // Orta
-        mmap.len().saturating_sub(SAMPLE_SIZE),    // Son
+        0,                                       // Başlangıç
+        mmap.len() / 2,                          // Orta
+        mmap.len().saturating_sub(SAMPLE_SIZE),  // Son
     ];
-    
+
     let mut total_lines = 0u64;
     let mut total_bytes = 0usize;
-    
+
     for &start in &positions {
         let end = (start + SAMPLE_SIZE).min(mmap.len());
         if end <= start {
             continue;
         }
-        
+
         let sample = &mmap[start..end];
         let lines = sample.iter().filter(|&&b| b == b'\n').count();
-        
+
         total_lines += lines as u64;
         total_bytes += sample.len();
     }
-    
+
     if total_lines == 0 {
-        // Fallback: tek satırlık dosya veya \n yok
         return if mmap.len() > 0 { 1 } else { 0 };
     }
-    
-    // Toplam tahmin = dosya boyutu * (toplam satır / toplam örnek byte)
+
     (mmap.len() as u64 * total_lines) / total_bytes as u64
 }
 
-/// Satır temizleme: SADECE CRLF/LF/CR satır sonlarını temizle
-/// 
-/// ⚠️ CRITICAL: Boşluklar (space/tab) KORUNUR!
-/// Brainwallet passphrase'leri " password " gibi başında/sonunda 
-/// boşluk içerebilir. Bunları temizlemek false negative'e yol açar.
-/// 
-/// Wordlist dosyalarında:
-/// - Windows CRLF (\r\n) veya Unix LF (\n) satır sonları temizlenir
-/// - Leading/trailing boşluklar KORUNUR (passphrase'in parçası olabilir)
-#[inline(always)]
-fn clean_line(line: &[u8]) -> &[u8] {
-    let mut l = line;
-    
-    // Strip ONLY line endings (CRLF, LF, CR) - preserve all other whitespace!
-    if l.ends_with(b"\r\n") {
-        l = &l[..l.len() - 2];
-    } else if l.ends_with(b"\n") || l.ends_with(b"\r") {
-        l = &l[..l.len() - 1];
-    }
-    
-    // ⚠️ NO WHITESPACE TRIMMING - spaces/tabs are part of the passphrase!
-    l
-}
-
-/// GPU-accelerated cracking (when gpu feature is enabled)
-#[cfg(feature = "gpu")]
+/// GPU-accelerated brainwallet cracking
+///
+/// ALL operations happen on GPU:
+/// - SHA256 (passphrase → private key)
+/// - secp256k1 scalar multiplication (private key → public key)
+/// - RIPEMD160 (public key → Bitcoin/Litecoin addresses)
+/// - Keccak256 (public key → Ethereum address)
+///
+/// # Panics
+/// Panics if GPU initialization fails. This is intentional - GPU is required.
 pub fn start_cracking(dict: &str, comparer: &Comparer) {
-    // Try GPU first
-    match try_gpu_cracking(dict, comparer) {
-        Ok(()) => return,
+    // Initialize GPU - this MUST succeed
+    let processor = match BatchProcessor::new() {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("⚠️  GPU initialization failed: {}", e);
-            eprintln!("   Falling back to CPU mode...\n");
+            eprintln!("❌ GPU initialization failed: {}", e);
+            eprintln!("   This application requires Apple Metal GPU.");
+            eprintln!("   Make sure you're running on macOS with Metal support.");
+            std::process::exit(1);
         }
-    }
-    
-    // Fall back to CPU
-    start_cracking_cpu(dict, comparer);
-}
+    };
 
-/// GPU-accelerated processing
-#[cfg(feature = "gpu")]
-fn try_gpu_cracking(dict: &str, comparer: &Comparer) -> Result<(), String> {
-    
-    let file = std::fs::File::open(dict).map_err(|e| e.to_string())?;
-    let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
-    
-    // Initialize GPU processor
-    let processor = BatchProcessor::new()?;
     let batch_size = processor.max_batch_size();
-    
-    println!("🚀 GPU Mode Enabled");
-    println!("   Batch size: {}", batch_size);
-    
+
+    println!("🚀 GPU Mode: Metal Accelerated");
+    println!("   Batch size: {} passphrases/dispatch", batch_size);
+
+    // Open dictionary file
+    let file = match std::fs::File::open(dict) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("❌ Cannot open dictionary: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let mmap = match unsafe { Mmap::map(&file) } {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("❌ Cannot memory-map dictionary: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Open log file
     let log = Mutex::new(BufWriter::new(
         OpenOptions::new()
             .append(true)
             .create(true)
             .open("found.txt")
-            .map_err(|e| e.to_string())?,
+            .expect("Cannot open found.txt"),
     ));
-    
+
+    // Progress bar
     let estimated_lines = estimate_line_count(&mmap);
-    println!("📊 Tahmini satır sayısı: {}", estimated_lines);
+    println!("📊 Estimated lines: {}", estimated_lines);
+    
     let pb = ProgressBar::new(estimated_lines);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} (~{eta} kaldı) {msg}")
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} (~{eta} remaining) {msg}")
             .unwrap()
             .progress_chars("█▓░"),
     );
-    pb.set_message("GPU tarama...");
-    
+    pb.set_message("GPU scanning...");
+
     let counter = AtomicU64::new(0);
     let mut batcher = PassphraseBatcher::new(&mmap, batch_size);
-    
+
+    // Main GPU processing loop
     while let Some(batch) = batcher.next_batch() {
         let batch_len = batch.len();
-        
-        // Process batch on GPU - get ALL results for BTC/LTC/ETH checking
-        let gpu_results = processor.process(&batch).map_err(|e| e.to_string())?;
-        
+
+        // Process batch on GPU - ALL crypto operations happen here
+        let gpu_results = match processor.process(&batch) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("⚠️  GPU processing error: {}", e);
+                continue;
+            }
+        };
+
         // Parallel check for all chains using GPU results
-        let all_matches: Vec<String> = gpu_results.par_iter()
+        let all_matches: Vec<String> = gpu_results
+            .par_iter()
             .filter_map(|result| {
                 if !result.is_valid() {
                     return None;
                 }
-                
+
                 let pass = String::from_utf8_lossy(&result.passphrase);
                 let mut rep = String::new();
-                
-                // Check Bitcoin
+
+                // Check Bitcoin (GPU-computed hashes)
                 if comparer.btc_on {
                     if comparer.btc_20.contains(&result.h160_c)
                         || comparer.btc_20.contains(&result.h160_u)
                         || comparer.btc_20.contains(&result.h160_nested)
                         || comparer.btc_32.contains(&result.taproot)
                     {
-                        rep.push_str(&format_gpu_match(result, &pass, comparer));
+                        rep.push_str(&format_btc_match(result, &pass));
                     }
                 }
-                
-                // Check Litecoin
+
+                // Check Litecoin (GPU-computed hashes)
                 if comparer.ltc_on {
                     if comparer.ltc_20.contains(&result.h160_c)
                         || comparer.ltc_20.contains(&result.h160_u)
@@ -169,25 +178,18 @@ fn try_gpu_cracking(dict: &str, comparer: &Comparer) -> Result<(), String> {
                         rep.push_str(&format_ltc_match(result, &pass));
                     }
                 }
-                
-                // Check Ethereum - use GPU-computed eth_addr directly (FULL GPU COMPUTATION!)
+
+                // Check Ethereum (GPU-computed Keccak256 address)
                 if comparer.eth_on {
                     if comparer.eth_20.contains(&result.eth_addr) {
-                        let eth_addr_hex = format!("0x{}", hex::encode(&result.eth_addr));
-                        rep.push_str(&format!(
-                            "=== ETHEREUM MATCH ===\n\
-                             Passphrase: {}\n\
-                             Address: {}\n\
-                             ========================\n\n",
-                            pass, eth_addr_hex
-                        ));
+                        rep.push_str(&format_eth_match(result, &pass));
                     }
                 }
-                
+
                 if rep.is_empty() { None } else { Some(rep) }
             })
             .collect();
-        
+
         // Write all matches
         if !all_matches.is_empty() {
             let mut f = log.lock().unwrap();
@@ -197,41 +199,38 @@ fn try_gpu_cracking(dict: &str, comparer: &Comparer) -> Result<(), String> {
             }
             let _ = f.flush();
         }
-        
+
         // Update progress
         let current = counter.fetch_add(batch_len as u64, Ordering::Relaxed);
         if current % 10_000 < batch_len as u64 {
             pb.set_position(current + batch_len as u64);
         }
     }
-    
+
+    // Finalize
     let final_count = counter.load(Ordering::Relaxed);
     pb.set_position(final_count);
-    
-    {
-        if let Ok(mut f) = log.lock() {
-            let _ = f.flush();
-        }
+
+    if let Ok(mut f) = log.lock() {
+        let _ = f.flush();
     }
-    
+
     let processed = processor.total_processed();
     pb.finish_with_message(format!(
-        "Tamamlandı! {} satır tarandı (GPU: {} işlendi)",
+        "Complete! {} lines scanned (GPU processed: {})",
         final_count, processed
     ));
-    
-    Ok(())
 }
 
-/// Format GPU match result - uses GPU-computed hashes directly (NO recomputation!)
-#[cfg(feature = "gpu")]
-fn format_gpu_match(result: &BrainwalletResult, pass: &str, _comparer: &Comparer) -> String {
-    // Use GPU-provided private key (NO SHA256 recomputation!)
+// ============================================================================
+// FORMATTING FUNCTIONS - All use GPU-computed values (NO recomputation!)
+// ============================================================================
+
+/// Format Bitcoin match - all values from GPU
+fn format_btc_match(result: &BrainwalletResult, pass: &str) -> String {
     let wif = compute_wif(&result.priv_key, 0x80, true);
-    
-    // Build addresses from GPU-computed hashes (NO secp256k1!)
     let hrp = bech32::Hrp::parse("bc").unwrap();
-    
+
     format!(
         "=== BITCOIN MATCH ===\n\
          Passphrase: {}\n\
@@ -244,42 +243,19 @@ fn format_gpu_match(result: &BrainwalletResult, pass: &str, _comparer: &Comparer
          =====================\n\n",
         pass,
         wif,
-        to_b58_static(0x00, &result.h160_c),
-        to_b58_static(0x00, &result.h160_u),
-        to_b58_static(0x05, &result.h160_nested),
+        to_base58check(0x00, &result.h160_c),
+        to_base58check(0x00, &result.h160_u),
+        to_base58check(0x05, &result.h160_nested),
         bech32::segwit::encode(hrp, bech32::segwit::VERSION_0, &result.h160_c).unwrap_or_default(),
         bech32::segwit::encode(hrp, bech32::segwit::VERSION_1, &result.taproot).unwrap_or_default(),
     )
 }
 
-/// Compute WIF from private key bytes (only SHA256 double hash, no EC)
-#[cfg(feature = "gpu")]
-fn compute_wif(priv_bytes: &[u8; 32], version: u8, compressed: bool) -> String {
-    let mut wif_bytes = vec![version];
-    wif_bytes.extend_from_slice(priv_bytes);
-    if compressed {
-        wif_bytes.push(0x01);
-    }
-    bs58::encode(&wif_bytes).with_check().into_string()
-}
-
-/// Base58Check encode with version byte
-#[cfg(feature = "gpu")]
-fn to_b58_static(version: u8, hash: &[u8; 20]) -> String {
-    let mut data = vec![version];
-    data.extend_from_slice(hash);
-    bs58::encode(&data).with_check().into_string()
-}
-
-/// Format LTC match result - uses GPU-computed hashes directly (NO recomputation!)
-#[cfg(feature = "gpu")]
+/// Format Litecoin match - all values from GPU
 fn format_ltc_match(result: &BrainwalletResult, pass: &str) -> String {
-    // Use GPU-provided private key (NO SHA256 recomputation!)
     let wif = compute_wif(&result.priv_key, 0xB0, true);
-    
-    // Build addresses from GPU-computed hashes (Litecoin version bytes)
     let hrp = bech32::Hrp::parse("ltc").unwrap();
-    
+
     format!(
         "=== LITECOIN MATCH ===\n\
          Passphrase: {}\n\
@@ -292,114 +268,44 @@ fn format_ltc_match(result: &BrainwalletResult, pass: &str) -> String {
          ======================\n\n",
         pass,
         wif,
-        to_b58_static(0x30, &result.h160_c),   // LTC P2PKH version
-        to_b58_static(0x30, &result.h160_u),
-        to_b58_static(0x32, &result.h160_nested), // LTC P2SH version
+        to_base58check(0x30, &result.h160_c),   // LTC P2PKH
+        to_base58check(0x30, &result.h160_u),
+        to_base58check(0x32, &result.h160_nested), // LTC P2SH
         bech32::segwit::encode(hrp, bech32::segwit::VERSION_0, &result.h160_c).unwrap_or_default(),
         bech32::segwit::encode(hrp, bech32::segwit::VERSION_1, &result.taproot).unwrap_or_default(),
     )
 }
 
-/// CPU-only cracking (fallback or when gpu feature is disabled)
-#[cfg(not(feature = "gpu"))]
-pub fn start_cracking(dict: &str, comparer: &Comparer) {
-    start_cracking_cpu(dict, comparer);
+/// Format Ethereum match - address from GPU Keccak256
+fn format_eth_match(result: &BrainwalletResult, pass: &str) -> String {
+    let eth_addr_hex = format!("0x{}", hex::encode(&result.eth_addr));
+    let priv_hex = hex::encode(&result.priv_key);
+
+    format!(
+        "=== ETHEREUM MATCH ===\n\
+         Passphrase: {}\n\
+         Address: {}\n\
+         Private Key: {}\n\
+         ========================\n\n",
+        pass, eth_addr_hex, priv_hex
+    )
 }
 
-/// CPU implementation of cracking
-fn start_cracking_cpu(dict: &str, comparer: &Comparer) {
-    let file = std::fs::File::open(dict).expect("Dict missing");
-    
-    // Memory-mapped file yükle
-    let mmap = unsafe { Mmap::map(&file).unwrap() };
-    
-    // BufWriter ile daha verimli dosya yazımı
-    let log = Mutex::new(BufWriter::new(
-        OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open("found.txt")
-            .unwrap(),
-    ));
-
-    // Örnek taramayla gerçek satır sayısı tahmini
-    let estimated_lines = estimate_line_count(&mmap);
-    println!("📊 Tahmini satır sayısı: {}", estimated_lines);
-    let pb = ProgressBar::new(estimated_lines);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} (~{eta} kaldı) {msg}")
-            .unwrap()
-            .progress_chars("█▓░"),
-    );
-    pb.set_message("CPU tarama...");
-    pb.set_position(0);
-    
-    let counter = AtomicU64::new(0);
-
-    mmap.par_split(|&b| b == b'\n').for_each(|raw_line| {
-        // Sadece satır sonlarını temizle - boşluklar passphrase parçası!
-        let line = clean_line(raw_line);
-        
-        if line.is_empty() {
-            return;
-        }
-
-        let w = MultiWallet::generate_active(
-            line,
-            comparer.btc_on,
-            comparer.ltc_on,
-            comparer.eth_on,
-        );
-        let pass = String::from_utf8_lossy(line);
-        let mut rep = String::new();
-
-        if let Some(btc) = w.btc {
-            if comparer.btc_20.contains(&btc.h160_c)
-                || comparer.btc_20.contains(&btc.h160_u)
-                || comparer.btc_20.contains(&btc.h160_nested)
-                || comparer.btc_32.contains(&btc.taproot)
-            {
-                rep.push_str(&btc.get_report(&pass));
-            }
-        }
-        if let Some(ltc) = w.ltc {
-            if comparer.ltc_20.contains(&ltc.h160_c)
-                || comparer.ltc_20.contains(&ltc.h160_u)
-                || comparer.ltc_20.contains(&ltc.h160_nested)
-                || comparer.ltc_32.contains(&ltc.taproot)
-            {
-                rep.push_str(&ltc.get_report(&pass));
-            }
-        }
-        if let Some(eth) = w.eth {
-            if comparer.eth_20.contains(&eth.address) {
-                rep.push_str(&eth.get_report(&pass));
-            }
-        }
-
-        if !rep.is_empty() {
-            let mut f = log.lock().unwrap();
-            let _ = f.write_all(rep.as_bytes());
-            let _ = f.flush();
-            pb.println(format!("\n{}", rep));
-        }
-
-        // Progress bar güncelleme (her 10K satırda - GPU ile tutarlı)
-        let current = counter.fetch_add(1, Ordering::Relaxed);
-        if current % 10_000 == 0 {
-            pb.set_position(current);
-        }
-    });
-    
-    let final_count = counter.load(Ordering::Relaxed);
-    pb.set_position(final_count);
-    
-    {
-        if let Ok(mut f) = log.lock() {
-            let _ = f.flush();
-        }
+/// Compute WIF from GPU-provided private key
+#[inline]
+fn compute_wif(priv_bytes: &[u8; 32], version: u8, compressed: bool) -> String {
+    let mut wif_bytes = vec![version];
+    wif_bytes.extend_from_slice(priv_bytes);
+    if compressed {
+        wif_bytes.push(0x01);
     }
-    
-    pb.finish_with_message(format!("Tamamlandı! {} satır tarandı.", final_count));
+    bs58::encode(&wif_bytes).with_check().into_string()
+}
+
+/// Base58Check encode with version byte
+#[inline]
+fn to_base58check(version: u8, hash: &[u8; 20]) -> String {
+    let mut data = vec![version];
+    data.extend_from_slice(hash);
+    bs58::encode(&data).with_check().into_string()
 }

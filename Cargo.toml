@@ -1,7 +1,9 @@
 [package]
 name = "brwallet"
-version = "0.1.0"
+version = "3.0.0"
 edition = "2021"
+description = "GPU-accelerated brainwallet cracker for Bitcoin, Litecoin, Ethereum"
+license = "MIT"
 
 [lib]
 name = "brwallet"
@@ -11,36 +13,42 @@ path = "src/lib.rs"
 name = "brwallet"
 path = "src/main.rs"
 
-[features]
-# GPU mode enabled by default - 30-300x faster than CPU
-default = ["gpu"]
-gpu = ["metal", "objc", "block", "lazy_static", "crossbeam-channel", "k256", "parking_lot"]
+# No optional features - GPU is REQUIRED
+# This application is designed for maximum performance using Apple Metal
 
 [dependencies]
-# Kriptografi
+# Cryptography (CPU fallback for testing only)
 sha2 = "0.10"
 ripemd = "0.1"
 secp256k1 = { version = "0.29", features = ["global-context"] }
-bs58 = { version = "0.5", features = ["check"] }
-hex = "0.4"
-
-# Performans ve Dosya İşleme
-rayon = "1.10"
-memmap2 = "0.9"
-rustc-hash = "2.0"  # FxHash - 3-5x daha hızlı HashSet lookup
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-indicatif = { version = "0.17", features = ["rayon"] }
-bincode = "1.3"
-bech32 = "0.11.1"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 
-# GPU (Metal) - macOS only
-metal = { version = "0.29", optional = true }
-objc = { version = "0.2", optional = true }
-block = { version = "0.1", optional = true }
-lazy_static = { version = "1.5", optional = true }
-crossbeam-channel = { version = "0.5", optional = true }
-k256 = { version = "0.13", optional = true }
-parking_lot = { version = "0.12", optional = true }
+# Encoding
+bs58 = { version = "0.5", features = ["check"] }
+hex = "0.4"
+bech32 = "0.11.1"
+
+# Data handling
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+
+# Performance
+rayon = "1.10"
+memmap2 = "0.9"
+rustc-hash = "2.0"  # FxHash - 3-5x faster than std HashMap
+
+# UI
+indicatif = { version = "0.17", features = ["rayon"] }
+
+# GPU (Metal) - REQUIRED for this application
+metal = "0.29"
+objc = "0.2"
+block = "0.1"
+lazy_static = "1.5"
+crossbeam-channel = "0.5"
+k256 = "0.13"
+parking_lot = "0.12"
+
+# System
 libc = "0.2"

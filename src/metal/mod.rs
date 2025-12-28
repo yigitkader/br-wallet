@@ -1,55 +1,47 @@
-//! GPU-accelerated brainwallet cracking using Metal
+//! GPU-Accelerated Brainwallet Processing - Apple Metal
 //!
-//! This module provides 10-100x speedup over CPU-only processing by:
-//! - Batch processing 65K+ passphrases per GPU dispatch
-//! - Parallel SHA256 + secp256k1 + RIPEMD160 on GPU
-//! - Zero-copy data transfer via unified memory (Apple Silicon)
+//! This module provides 30-300x speedup over CPU by running ALL cryptographic
+//! operations on Apple Metal GPU:
+//!
+//! - SHA256 (passphrase → private key)
+//! - secp256k1 scalar multiplication (private key → public key)
+//! - RIPEMD160 (public key → Bitcoin/Litecoin HASH160)
+//! - Keccak256 (public key → Ethereum address)
 //!
 //! ## Architecture
 //!
 //! ```text
-//! CPU                          GPU
-//! ──────────────────          ──────────────────
-//! Passphrase batch   ───────> SHA256 (parallel)
-//!                              ↓
-//!                             secp256k1 point mul
-//!                              ↓
-//!                             HASH160
-//!                              ↓
-//! HashSet.contains() <─────── [h160_c: 20 bytes] × 65K
+//! CPU (minimal)                 GPU (all crypto)
+//! ─────────────────            ─────────────────────────────
+//! Passphrase batch   ───────>  SHA256 → secp256k1 → HASH160
+//!                               ↓
+//!                              Keccak256 (ETH)
+//!                               ↓
+//! HashSet.contains() <─────── [h160_c, h160_u, h160_nested,
+//!                               taproot, eth_addr, priv_key]
 //! ```
 //!
-//! ## Usage
+//! ## Output per passphrase: 144 bytes
 //!
-//! ```ignore
-//! use brwallet::metal::GpuBrainwallet;
-//!
-//! let gpu = GpuBrainwallet::new()?;
-//! let passphrases: Vec<&[u8]> = vec![b"password1", b"password2"];
-//! let results = gpu.process_batch(&passphrases)?;
-//! // results: Vec<BrainwalletResult> with h160_c, h160_u, h160_nested, taproot
-//! ```
+//! | Field        | Size | Description                    |
+//! |--------------|------|--------------------------------|
+//! | h160_c       | 20   | HASH160(compressed pubkey)     |
+//! | h160_u       | 20   | HASH160(uncompressed pubkey)   |
+//! | h160_nested  | 20   | HASH160(P2SH-P2WPKH script)    |
+//! | taproot      | 32   | Taproot x-only pubkey          |
+//! | eth_addr     | 20   | Keccak256(pubkey)[12:32]       |
+//! | priv_key     | 32   | SHA256(passphrase)             |
 
-#[cfg(feature = "gpu")]
 mod gpu;
-
-#[cfg(feature = "gpu")]
 pub mod batch;
 
-#[cfg(feature = "gpu")]
+// GpuBrainwallet exposed for advanced usage
+#[allow(unused_imports)]
 pub use gpu::GpuBrainwallet;
 
-#[cfg(feature = "gpu")]
 pub use batch::{BatchProcessor, BrainwalletResult, PassphraseBatcher};
 
-/// Check if GPU is available on this system
-#[cfg(feature = "gpu")]
+/// Check if Metal GPU is available on this system
 pub fn is_gpu_available() -> bool {
     metal::Device::system_default().is_some()
 }
-
-#[cfg(not(feature = "gpu"))]
-pub fn is_gpu_available() -> bool {
-    false
-}
-

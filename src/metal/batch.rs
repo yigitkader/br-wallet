@@ -80,6 +80,7 @@ impl BatchProcessor {
     /// 
     /// This is the most efficient method - no intermediate allocations.
     /// Returns only matching passphrases with their results.
+    #[allow(dead_code)]
     pub fn process_and_match<F>(
         &self,
         passphrases: &[&[u8]],
@@ -137,16 +138,19 @@ impl BatchProcessor {
     }
     
     /// Signal to stop processing
+    #[allow(dead_code)]
     pub fn stop(&self) {
         self.gpu.stop();
     }
     
     /// Check if should stop
+    #[allow(dead_code)]
     pub fn should_stop(&self) -> bool {
         self.gpu.should_stop()
     }
     
     /// Get reference to underlying GPU processor
+    #[allow(dead_code)]
     pub fn gpu(&self) -> &GpuBrainwallet {
         &self.gpu
     }
@@ -215,11 +219,13 @@ impl<'a> PassphraseBatcher<'a> {
     }
     
     /// Reset to beginning
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.position = 0;
     }
     
     /// Get current position (bytes processed)
+    #[allow(dead_code)]
     pub fn position(&self) -> usize {
         self.position
     }

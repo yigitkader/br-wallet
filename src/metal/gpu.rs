@@ -74,6 +74,7 @@ impl GpuBrainwalletResult {
     
     /// Check if result is valid (non-zero)
     #[inline]
+    #[allow(dead_code)]
     pub fn is_valid(&self) -> bool {
         self.h160_c.iter().any(|&b| b != 0)
     }
@@ -81,6 +82,7 @@ impl GpuBrainwalletResult {
 
 /// GPU tier configuration based on hardware
 #[derive(Clone)]
+#[allow(dead_code)]
 struct GpuTier {
     name: String,
     threads_per_dispatch: usize,
@@ -125,8 +127,8 @@ impl GpuTier {
 }
 
 /// GPU Brainwallet processor
+#[allow(dead_code)]
 pub struct GpuBrainwallet {
-    #[allow(dead_code)]
     device: Device,
     pipeline: ComputePipelineState,
     queue: CommandQueue,
@@ -311,6 +313,7 @@ impl GpuBrainwallet {
     /// Process a batch and return raw bytes
     /// 
     /// This is more efficient when you only need to check specific hashes.
+    #[allow(dead_code)]
     pub fn process_batch_raw(&self, passphrases: &[&[u8]]) -> Result<&[u8], String> {
         if passphrases.is_empty() {
             return Ok(&[]);
@@ -386,11 +389,13 @@ impl GpuBrainwallet {
     }
     
     /// Signal to stop processing
+    #[allow(dead_code)]
     pub fn stop(&self) {
         self.should_stop.store(true, Ordering::SeqCst);
     }
     
     /// Check if should stop
+    #[allow(dead_code)]
     pub fn should_stop(&self) -> bool {
         self.should_stop.load(Ordering::SeqCst)
     }

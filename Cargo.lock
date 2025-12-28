@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "brwallet"
-version = "0.1.0"
+version = "3.0.0"
 dependencies = [
  "bech32",
  "bincode",
