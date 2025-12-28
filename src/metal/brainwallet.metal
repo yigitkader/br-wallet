@@ -63,8 +63,9 @@ constant uchar RIPEMD_RR[80] = {5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12,6,11,3,7,0
 constant uchar RIPEMD_SL[80] = {11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8,7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5,11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12,9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6};
 constant uchar RIPEMD_SR[80] = {8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5,15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8,8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11};
 
-// Output size per passphrase: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) = 92 bytes
-#define OUTPUT_SIZE 92
+// Output size per passphrase: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + pubkey_u(64) = 156 bytes
+// pubkey_u is X||Y (without 0x04 prefix) for Ethereum Keccak256 on CPU
+#define OUTPUT_SIZE 156
 #define MAX_PASSPHRASE_LEN 128
 
 // ============================================================================
@@ -853,7 +854,7 @@ kernel void process_brainwallet_batch(
         store_be(Qx, taproot);
     }
     
-    // Write output: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) = 92 bytes
+    // Write output: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + pubkey_u(64) = 156 bytes
     for (int i = 0; i < 20; i++) {
         output[out_offset + i] = h160_c[i];
         output[out_offset + 20 + i] = h160_u[i];
@@ -861,6 +862,10 @@ kernel void process_brainwallet_batch(
     }
     for (int i = 0; i < 32; i++) {
         output[out_offset + 60 + i] = taproot[i];
+    }
+    // pubkey_u without 0x04 prefix (64 bytes = X || Y)
+    for (int i = 0; i < 64; i++) {
+        output[out_offset + 92 + i] = pubkey_u[1 + i];
     }
 }
 

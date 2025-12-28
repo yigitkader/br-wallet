@@ -106,82 +106,89 @@ fn try_gpu_cracking(dict: &str, comparer: &Comparer) -> Result<(), String> {
     while let Some(batch) = batcher.next_batch() {
         let batch_len = batch.len();
         
-        // Process batch on GPU and check for matches
-        let matches = processor.process_and_match(&batch, |h160_c, h160_u, h160_nested, taproot| {
-            // Check Bitcoin
-            if comparer.btc_on {
-                if comparer.btc_20.contains(h160_c)
-                    || comparer.btc_20.contains(h160_u)
-                    || comparer.btc_20.contains(h160_nested)
-                    || comparer.btc_32.contains(taproot)
-                {
-                    return true;
-                }
-            }
-            
-            // Check Litecoin (same hash format as Bitcoin)
-            if comparer.ltc_on {
-                if comparer.ltc_20.contains(h160_c)
-                    || comparer.ltc_20.contains(h160_u)
-                    || comparer.ltc_20.contains(h160_nested)
-                    || comparer.ltc_32.contains(taproot)
-                {
-                    return true;
-                }
-            }
-            
-            // Note: Ethereum and Solana use different derivation paths
-            // They are still processed by CPU for now
-            
-            false
-        }).map_err(|e| e.to_string())?;
+        // Process batch on GPU - get ALL results for BTC/LTC/ETH checking
+        let gpu_results = processor.process(&batch).map_err(|e| e.to_string())?;
         
-        // Process matches
-        for result in matches {
-            let pass = String::from_utf8_lossy(&result.passphrase);
-            let rep = format_gpu_match(&result, &pass, comparer);
-            
-            if !rep.is_empty() {
-                let mut f = log.lock().unwrap();
-                let _ = f.write_all(rep.as_bytes());
-                let _ = f.flush();
-                pb.println(format!("\n{}", rep));
-            }
-        }
-        
-        // For Ethereum and Solana, we need CPU fallback for now
-        // (they use different derivation: keccak256 for ETH, ed25519 for SOL)
-        if comparer.eth_on || comparer.sol_on {
-            for passphrase in &batch {
-                let w = MultiWallet::generate_active(
-                    passphrase,
-                    false, // BTC already checked by GPU
-                    false, // LTC already checked by GPU
-                    comparer.eth_on,
-                    comparer.sol_on,
-                );
+        // Parallel check for all chains using GPU results
+        let all_matches: Vec<String> = gpu_results.par_iter()
+            .filter_map(|result| {
+                if !result.is_valid() {
+                    return None;
+                }
                 
-                let pass = String::from_utf8_lossy(passphrase);
+                let pass = String::from_utf8_lossy(&result.passphrase);
                 let mut rep = String::new();
                 
-                if let Some(eth) = w.eth {
-                    if comparer.eth_20.contains(&eth.address) {
-                        rep.push_str(&eth.get_report(&pass));
-                    }
-                }
-                if let Some(sol) = w.sol {
-                    if comparer.sol_32.contains(&sol.address) {
-                        rep.push_str(&sol.get_report(&pass));
+                // Check Bitcoin
+                if comparer.btc_on {
+                    if comparer.btc_20.contains(&result.h160_c)
+                        || comparer.btc_20.contains(&result.h160_u)
+                        || comparer.btc_20.contains(&result.h160_nested)
+                        || comparer.btc_32.contains(&result.taproot)
+                    {
+                        rep.push_str(&format_gpu_match(result, &pass, comparer));
                     }
                 }
                 
-                if !rep.is_empty() {
-                    let mut f = log.lock().unwrap();
-                    let _ = f.write_all(rep.as_bytes());
-                    let _ = f.flush();
-                    pb.println(format!("\n{}", rep));
+                // Check Litecoin
+                if comparer.ltc_on {
+                    if comparer.ltc_20.contains(&result.h160_c)
+                        || comparer.ltc_20.contains(&result.h160_u)
+                        || comparer.ltc_20.contains(&result.h160_nested)
+                        || comparer.ltc_32.contains(&result.taproot)
+                    {
+                        // For LTC match, generate proper report
+                        rep.push_str(&format!("[LTC MATCH] passphrase: {}\n", pass));
+                    }
                 }
+                
+                // Check Ethereum - use GPU pubkey_u with Keccak256 (NO secp256k1 re-computation!)
+                if comparer.eth_on {
+                    use tiny_keccak::{Hasher, Keccak};
+                    let mut keccak = Keccak::v256();
+                    keccak.update(&result.pubkey_u);
+                    let mut hash = [0u8; 32];
+                    keccak.finalize(&mut hash);
+                    
+                    let eth_addr: [u8; 20] = hash[12..32].try_into().unwrap();
+                    
+                    if comparer.eth_20.contains(&eth_addr) {
+                        let eth_addr_hex = format!("0x{}", hex::encode(&eth_addr));
+                        rep.push_str(&format!(
+                            "=== ETHEREUM MATCH ===\n\
+                             Passphrase: {}\n\
+                             Address: {}\n\
+                             ========================\n\n",
+                            pass, eth_addr_hex
+                        ));
+                    }
+                }
+                
+                // For Solana, we still need CPU (Ed25519 derivation)
+                if comparer.sol_on {
+                    let w = MultiWallet::generate_active(
+                        &result.passphrase,
+                        false, false, false, true,
+                    );
+                    if let Some(sol) = w.sol {
+                        if comparer.sol_32.contains(&sol.address) {
+                            rep.push_str(&sol.get_report(&pass));
+                        }
+                    }
+                }
+                
+                if rep.is_empty() { None } else { Some(rep) }
+            })
+            .collect();
+        
+        // Write all matches
+        if !all_matches.is_empty() {
+            let mut f = log.lock().unwrap();
+            for rep in &all_matches {
+                let _ = f.write_all(rep.as_bytes());
+                pb.println(format!("\n{}", rep));
             }
+            let _ = f.flush();
         }
         
         // Update progress

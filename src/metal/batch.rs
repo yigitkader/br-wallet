@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use super::gpu::{GpuBrainwallet, GpuBrainwalletResult, OUTPUT_SIZE};
+use super::gpu::{GpuBrainwallet, OUTPUT_SIZE};
 
 /// Result from batch processing - matches CPU wallet format
 #[derive(Clone, Debug)]
@@ -20,6 +20,9 @@ pub struct BrainwalletResult {
     pub h160_nested: [u8; 20],
     /// Taproot x-only pubkey (32 bytes)
     pub taproot: [u8; 32],
+    /// Uncompressed public key (64 bytes, X||Y without 0x04 prefix)
+    /// Used for Ethereum Keccak256 address derivation on CPU
+    pub pubkey_u: [u8; 64],
 }
 
 impl BrainwalletResult {
@@ -63,6 +66,7 @@ impl BatchProcessor {
                 h160_u: gpu_result.h160_u,
                 h160_nested: gpu_result.h160_nested,
                 taproot: gpu_result.taproot,
+                pubkey_u: gpu_result.pubkey_u,
             });
         }
         
@@ -99,6 +103,7 @@ impl BatchProcessor {
             let h160_u: [u8; 20] = data[20..40].try_into().unwrap();
             let h160_nested: [u8; 20] = data[40..60].try_into().unwrap();
             let taproot: [u8; 32] = data[60..92].try_into().unwrap();
+            let pubkey_u: [u8; 64] = data[92..156].try_into().unwrap();
             
             // Skip invalid results
             if h160_c.iter().all(|&b| b == 0) {
@@ -113,6 +118,7 @@ impl BatchProcessor {
                     h160_u,
                     h160_nested,
                     taproot,
+                    pubkey_u,
                 });
             }
         }
