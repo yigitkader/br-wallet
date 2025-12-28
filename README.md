@@ -24,3 +24,5 @@ GPU Output: 144 byte/passphrase
 Input Stride: 144 byte (16-byte aligned)
 Tüm kripto: GPU'da
 CPU işi: Sadece eşleşme kontrolü (HashSet lookup)
+
+⚠️ Not: GPU testleri --test-threads=1 ile çalıştırılmalı çünkü Metal GPU paralel test yürütmelerinde race condition oluşturabiliyor.

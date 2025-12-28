@@ -1,19 +1,16 @@
 //! GPU Stress Test - Continuous operation test
 //!
-//! Bu test GPU'nun uzun süreli kullanımda stabil çalıştığını doğrular.
+//! Tests GPU stability under heavy load.
 
-#[cfg(feature = "gpu")]
 use brwallet::metal::BatchProcessor;
 
-/// Stress test: 1 milyon passphrase işle, hash doğruluğunu kontrol et
+/// Stress test: 1 million passphrases
 #[test]
-#[cfg(feature = "gpu")]
 fn test_gpu_stress_1m_passphrases() {
     use std::time::Instant;
     
     if metal::Device::system_default().is_none() {
-        println!("No Metal device - skipping stress test");
-        return;
+        panic!("No Metal device - GPU is required!");
     }
     
     let processor = BatchProcessor::new().expect("GPU init failed");
@@ -68,28 +65,26 @@ fn test_gpu_stress_1m_passphrases() {
     // All passphrases should produce valid results
     assert_eq!(total_valid, total_passphrases, "All passphrases should produce valid hashes");
     
-    // Should complete in reasonable time (< 60 seconds for 1M on M1)
+    // Should complete in reasonable time (< 120 seconds for 1M on M1)
     assert!(elapsed.as_secs() < 120, "Stress test took too long: {:?}", elapsed);
     
     println!("\n✅ Stress test passed!");
 }
 
-/// Memory stability test: Birden fazla batch cycle
+/// Memory stability test: Multiple batch cycles
 #[test]
-#[cfg(feature = "gpu")]
 fn test_gpu_memory_stability() {
     if metal::Device::system_default().is_none() {
-        println!("No Metal device - skipping");
-        return;
+        panic!("No Metal device - GPU is required!");
     }
     
     let processor = BatchProcessor::new().expect("GPU init failed");
     
     println!("\n=== GPU Memory Stability Test ===");
     
-    // 20 cycle - küçük batch'ler (GPU memory pressure'ı azalt)
+    // 20 cycles with small batches
     let cycles = 20;
-    let batch_size = 1000;  // Küçük batch
+    let batch_size = 1000;
     
     for cycle in 0..cycles {
         let mut test_data = Vec::with_capacity(batch_size);
@@ -111,20 +106,18 @@ fn test_gpu_memory_stability() {
             println!("  Cycle {}/{} - OK", cycle + 1, cycles);
         }
         
-        // GPU'ya nefes aldır
+        // Give GPU a brief rest
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     
     println!("\n✅ Memory stability test passed! ({} cycles)", cycles);
 }
 
-/// Consistency test: Aynı input için aynı output
+/// Consistency test: Same input produces same output
 #[test]
-#[cfg(feature = "gpu")]
 fn test_gpu_consistency() {
     if metal::Device::system_default().is_none() {
-        println!("No Metal device - skipping");
-        return;
+        panic!("No Metal device - GPU is required!");
     }
     
     let processor = BatchProcessor::new().expect("GPU init failed");
@@ -137,10 +130,10 @@ fn test_gpu_consistency() {
         b"consistency_test_3",
     ];
     
-    // İlk run
+    // First run
     let results1 = processor.process(&test_phrases).expect("GPU process failed");
     
-    // 10 kez tekrarla ve sonuçları karşılaştır
+    // Repeat 10 times and compare
     for run in 0..10 {
         let results2 = processor.process(&test_phrases).expect("GPU process failed");
         
@@ -158,4 +151,3 @@ fn test_gpu_consistency() {
     
     println!("✅ Consistency test passed! (10 runs identical)");
 }
-

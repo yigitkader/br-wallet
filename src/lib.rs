@@ -11,21 +11,20 @@
 //!
 //! ## GPU Operations
 //!
-//! All operations computed on Metal GPU:
+//! All cryptographic operations computed on Metal GPU:
 //! - SHA256 (passphrase → private key)
-//! - secp256k1 scalar multiplication
-//! - RIPEMD160 (HASH160)
-//! - Keccak256 (Ethereum)
+//! - secp256k1 scalar multiplication (private key → public key)
+//! - RIPEMD160 (public key → HASH160)
+//! - Keccak256 (public key → Ethereum address)
 //!
 //! ## Performance
 //!
 //! - 30-300x faster than CPU-only implementations
 //! - Processes 100K+ passphrases per second on Apple Silicon
+//!
+//! ## Requirements
+//!
+//! - macOS with Metal GPU support (Apple Silicon or discrete GPU)
 
 pub mod comparer;
 pub mod metal;
-
-// CPU brainwallet module kept for reference/testing only
-// Not used in main application path
-#[doc(hidden)]
-pub mod brainwallet;
