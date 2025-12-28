@@ -39,8 +39,11 @@ pub mod batch;
 pub use batch::{BatchProcessor, BrainwalletResult, PassphraseBatcher};
 pub use batch::{RawBatchOutput, RawGpuResult};
 
+// Pipelined processing (high-performance mode)
+pub use batch::{PipelinedBatchProcessor, RawBatchOutputOwned};
+
 // Re-export GPU types for advanced users who need direct GPU access
-pub use gpu::GpuBrainwallet;
+pub use gpu::{GpuBrainwallet, PipelinedGpuBrainwallet};
 
 // Constants for buffer sizing
 pub use gpu::{OUTPUT_SIZE, MAX_PASSPHRASE_LEN, PASSPHRASE_STRIDE};

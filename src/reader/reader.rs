@@ -12,7 +12,7 @@
 //! CPU fallback has been removed for maximum performance.
 
 use crate::comparer::Comparer;
-use crate::metal::{BatchProcessor, BrainwalletResult, PassphraseBatcher};
+use crate::metal::{PipelinedBatchProcessor, BrainwalletResult, PassphraseBatcher, RawBatchOutputOwned};
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -65,7 +65,7 @@ fn estimate_line_count(mmap: &Mmap) -> u64 {
     (mmap.len() as u64 * total_lines) / total_bytes as u64
 }
 
-/// GPU-accelerated brainwallet cracking
+/// GPU-accelerated brainwallet cracking with PIPELINED processing
 ///
 /// ALL operations happen on GPU:
 /// - SHA256 (passphrase → private key)
@@ -73,11 +73,22 @@ fn estimate_line_count(mmap: &Mmap) -> u64 {
 /// - RIPEMD160 (public key → Bitcoin/Litecoin addresses)
 /// - Keccak256 (public key → Ethereum address)
 ///
+/// ## Pipeline Architecture
+/// 
+/// Uses double-buffering to overlap GPU and CPU work:
+/// ```text
+/// Time  │ GPU Buffer 0      │ GPU Buffer 1      │ CPU
+/// ──────┼───────────────────┼───────────────────┼─────────────────
+///   0   │ Process Batch 0   │                   │ Prepare Batch 1
+///   1   │                   │ Process Batch 1   │ Check Batch 0, Prep 2
+///   2   │ Process Batch 2   │                   │ Check Batch 1, Prep 3
+/// ```
+///
 /// # Panics
 /// Panics if GPU initialization fails. This is intentional - GPU is required.
 pub fn start_cracking(dict: &str, comparer: &Comparer) {
-    // Initialize GPU - this MUST succeed
-    let processor = match BatchProcessor::new() {
+    // Initialize pipelined GPU processor
+    let processor = match PipelinedBatchProcessor::new() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("❌ GPU initialization failed: {}", e);
@@ -89,8 +100,9 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
 
     let batch_size = processor.max_batch_size();
 
-    println!("🚀 GPU Mode: Metal Accelerated");
+    println!("🚀 GPU Mode: Metal Accelerated (PIPELINED)");
     println!("   Batch size: {} passphrases/dispatch", batch_size);
+    println!("   Double-buffering: GPU and CPU work overlap");
 
     // Open dictionary file
     let file = match std::fs::File::open(dict) {
@@ -129,110 +141,159 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
             .unwrap()
             .progress_chars("█▓░"),
     );
-    pb.set_message("GPU scanning...");
+    pb.set_message("GPU scanning (pipelined)...");
 
     let counter = AtomicU64::new(0);
     let mut batcher = PassphraseBatcher::new(&mmap, batch_size);
     
     // Throttled progress updates (every 500ms max)
-    // Higher interval reduces terminal I/O overhead at high throughput (100K+/sec)
     let mut last_pb_update = Instant::now();
     const PB_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
 
-    // Main GPU processing loop - ZERO-ALLOCATION MATCHING
-    // Only allocate BrainwalletResult when a match is found (99.99%+ don't match)
-    while let Some(batch) = batcher.next_batch() {
-        let batch_len = batch.len();
-
-        // Process batch on GPU - returns raw bytes (no allocation per passphrase)
-        let raw_output = match processor.process_raw(&batch) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("⚠️  GPU processing error: {}", e);
-                continue;
+    // ========================================================================
+    // PIPELINED PROCESSING LOOP
+    // ========================================================================
+    // 
+    // Key insight: While GPU processes batch N, CPU can:
+    // 1. Check results from batch N-1 (parallel with rayon)
+    // 2. Prepare batch N+1 (read from mmap)
+    //
+    // This eliminates idle time on both GPU and CPU.
+    
+    // Track previous batch for result processing
+    let mut prev_batch: Option<Vec<&[u8]>> = None;
+    let mut pending_output: Option<RawBatchOutputOwned> = None;
+    
+    // Submit first batch to GPU (prime the pipeline)
+    if let Some(batch) = batcher.next_batch() {
+        if let Err(e) = processor.submit(&batch) {
+            eprintln!("⚠️  GPU submit error: {}", e);
+        } else {
+            prev_batch = Some(batch);
+        }
+    }
+    
+    // Main pipelined loop
+    loop {
+        // Get next batch while GPU is processing
+        let current_batch = batcher.next_batch();
+        
+        // Wait for GPU results from previous submission
+        if prev_batch.is_some() {
+            match processor.wait_results() {
+                Ok(output) => {
+                    pending_output = Some(output);
+                }
+                Err(e) => {
+                    eprintln!("⚠️  GPU processing error: {}", e);
+                    pending_output = None;
+                }
             }
-        };
-
-        // PARALLEL matching using rayon - all CPU cores utilized
-        // Zero-allocation: only allocate BrainwalletResult on match
-        let all_matches: Vec<String> = batch
-            .par_iter()
-            .enumerate()
-            .filter_map(|(i, passphrase)| {
-                let raw = raw_output.get(i)?;
-                
-                // Skip invalid results (zero hashes)
-                if !raw.is_valid() {
-                    return None;
-                }
-                
-                let mut rep = String::new();
-
-                // Check Bitcoin - Primary keypair (zero-copy hash access)
-                if comparer.btc_on {
-                    if comparer.btc_20.contains(raw.h160_c())
-                        || comparer.btc_20.contains(raw.h160_u())
-                        || comparer.btc_20.contains(raw.h160_nested())
-                    {
-                        let result = raw.to_owned(passphrase);
-                        rep.push_str(&format_btc_match(&result, false));
-                    }
-                    // Check Bitcoin - GLV keypair (FREE 2x throughput!)
-                    else if comparer.btc_20.contains(raw.glv_h160_c()) {
-                        let result = raw.to_owned(passphrase);
-                        rep.push_str(&format_btc_match(&result, true));
-                    }
-                }
-
-                // Check Litecoin - Primary keypair (zero-copy hash access)
-                if comparer.ltc_on {
-                    if comparer.ltc_20.contains(raw.h160_c())
-                        || comparer.ltc_20.contains(raw.h160_u())
-                        || comparer.ltc_20.contains(raw.h160_nested())
-                    {
-                        let result = raw.to_owned(passphrase);
-                        rep.push_str(&format_ltc_match(&result, false));
-                    }
-                    // Check Litecoin - GLV keypair (FREE 2x throughput!)
-                    else if comparer.ltc_20.contains(raw.glv_h160_c()) {
-                        let result = raw.to_owned(passphrase);
-                        rep.push_str(&format_ltc_match(&result, true));
-                    }
-                }
-
-                // Check Ethereum - Primary keypair (zero-copy hash access)
-                if comparer.eth_on {
-                    if comparer.eth_20.contains(raw.eth_addr()) {
-                        let result = raw.to_owned(passphrase);
-                        rep.push_str(&format_eth_match(&result, false));
-                    }
-                    // Check Ethereum - GLV keypair (FREE 2x throughput!)
-                    else if comparer.eth_20.contains(raw.glv_eth_addr()) {
-                        let result = raw.to_owned(passphrase);
-                        rep.push_str(&format_eth_match(&result, true));
-                    }
-                }
-
-                if rep.is_empty() { None } else { Some(rep) }
-            })
-            .collect();
-
-        // Write all matches
-        if !all_matches.is_empty() {
-            let mut f = log.lock().unwrap();
-            for rep in &all_matches {
-            let _ = f.write_all(rep.as_bytes());
-            pb.println(format!("\n{}", rep));
         }
-            let _ = f.flush();
+        
+        // Submit current batch to GPU (non-blocking)
+        if let Some(ref batch) = current_batch {
+            if let Err(e) = processor.submit(batch) {
+                eprintln!("⚠️  GPU submit error: {}", e);
+            }
         }
+        
+        // Process previous results on CPU while GPU works on current batch
+        if let (Some(batch), Some(raw_output)) = (&prev_batch, &pending_output) {
+            let batch_len = batch.len();
+            
+            // PARALLEL matching using rayon
+            let all_matches: Vec<String> = batch
+                .par_iter()
+                .enumerate()
+                .filter_map(|(i, passphrase)| {
+                    let raw = raw_output.get(i)?;
+                    
+                    if !raw.is_valid() {
+                        return None;
+                    }
+                    
+                    let mut rep = String::new();
+                    
+                    // Lazily create result only when needed
+                    let mut result: Option<BrainwalletResult> = None;
+                    let ensure_result = || raw.to_owned(passphrase);
 
-        // Update progress with throttling (max once per 100ms)
-        let current = counter.fetch_add(batch_len as u64, Ordering::Relaxed);
-        let now = Instant::now();
-        if now.duration_since(last_pb_update) >= PB_UPDATE_INTERVAL {
-            pb.set_position(current + batch_len as u64);
-            last_pb_update = now;
+                    // Check Bitcoin - Primary keypair
+                    if comparer.btc_on {
+                        if comparer.btc_20.contains(raw.h160_c())
+                            || comparer.btc_20.contains(raw.h160_u())
+                            || comparer.btc_20.contains(raw.h160_nested())
+                        {
+                            let r = result.get_or_insert_with(&ensure_result);
+                            rep.push_str(&format_btc_match(r, false));
+                        }
+                        // Check GLV INDEPENDENTLY
+                        if comparer.btc_20.contains(raw.glv_h160_c()) {
+                            let r = result.get_or_insert_with(&ensure_result);
+                            rep.push_str(&format_btc_match(r, true));
+                        }
+                    }
+
+                    // Check Litecoin - Primary keypair
+                    if comparer.ltc_on {
+                        if comparer.ltc_20.contains(raw.h160_c())
+                            || comparer.ltc_20.contains(raw.h160_u())
+                            || comparer.ltc_20.contains(raw.h160_nested())
+                        {
+                            let r = result.get_or_insert_with(&ensure_result);
+                            rep.push_str(&format_ltc_match(r, false));
+                        }
+                        // Check GLV INDEPENDENTLY
+                        if comparer.ltc_20.contains(raw.glv_h160_c()) {
+                            let r = result.get_or_insert_with(&ensure_result);
+                            rep.push_str(&format_ltc_match(r, true));
+                        }
+                    }
+
+                    // Check Ethereum - Primary keypair
+                    if comparer.eth_on {
+                        if comparer.eth_20.contains(raw.eth_addr()) {
+                            let r = result.get_or_insert_with(&ensure_result);
+                            rep.push_str(&format_eth_match(r, false));
+                        }
+                        // Check GLV INDEPENDENTLY
+                        if comparer.eth_20.contains(raw.glv_eth_addr()) {
+                            let r = result.get_or_insert_with(&ensure_result);
+                            rep.push_str(&format_eth_match(r, true));
+                        }
+                    }
+
+                    if rep.is_empty() { None } else { Some(rep) }
+                })
+                .collect();
+
+            // Write matches
+            if !all_matches.is_empty() {
+                let mut f = log.lock().unwrap();
+                for rep in &all_matches {
+                    let _ = f.write_all(rep.as_bytes());
+                    pb.println(format!("\n{}", rep));
+                }
+                let _ = f.flush();
+            }
+
+            // Update progress
+            let current = counter.fetch_add(batch_len as u64, Ordering::Relaxed);
+            let now = Instant::now();
+            if now.duration_since(last_pb_update) >= PB_UPDATE_INTERVAL {
+                pb.set_position(current + batch_len as u64);
+                last_pb_update = now;
+            }
+        }
+        
+        // Move current to previous for next iteration
+        prev_batch = current_batch;
+        pending_output = None;
+        
+        // Exit if no more batches
+        if prev_batch.is_none() {
+            break;
         }
     }
 

@@ -1003,9 +1003,35 @@ inline void ext_jac_add_affine(ulong4 X1, ulong4 Y1, ulong4 Z1, ulong4 ZZ1,
 // Standard MSB-first double-and-add algorithm using Extended Jacobian coordinates.
 // Uses secp256k1 fast reduction (P = 2^256 - K) for efficient modular arithmetic.
 //
-// Future optimization opportunities:
-// - wNAF (Windowed Non-Adjacent Form) for ~2x speedup
-// - GLV Endomorphism for 2x throughput (see referance-project/keygen.metal)
+// ⚠️ KNOWN PERFORMANCE ISSUE: WARP DIVERGENCE
+// --------------------------------------------
+// The conditional `if ((bits >> (63 - bit)) & 1)` causes warp divergence:
+// - GPU threads execute in SIMD groups (warps/simdgroups) of 32 threads
+// - When threads in a warp take different branches, GPU executes BOTH paths
+// - For random private keys, ~50% of threads have bit=1 at any position
+// - This means BOTH double and add are executed every iteration, but masked
+// - Effective throughput is reduced by ~30-40%
+//
+// POTENTIAL OPTIMIZATIONS (not implemented):
+// ------------------------------------------
+// 1. wNAF (Windowed Non-Adjacent Form): 
+//    - Reduces average additions by using signed digit representation
+//    - Expected speedup: ~2x
+//    - Complexity: Requires precomputed table of [G, 3G, 5G, 7G, ...]
+//
+// 2. Fixed-base Comb Method:
+//    - Precompute [2^i * G] for i = 0..255
+//    - Process 4-8 bits at a time using table lookups
+//    - Expected speedup: 4-8x
+//    - Complexity: 8KB+ lookup table per thread
+//
+// 3. GLV Decomposition (different from current GLV):
+//    - Split k = k1 + k2*λ where k1, k2 are ~128-bit
+//    - Compute k1*G + k2*λG using Shamir's trick
+//    - Expected speedup: ~1.5x for the scalar mul itself
+//    - Already using GLV for address derivation (different optimization)
+//
+// Current approach prioritizes simplicity and correctness over raw speed.
 
 void scalar_mul(ulong4 k, 
                 thread ulong4& out_X, thread ulong4& out_Y,
@@ -1021,16 +1047,17 @@ void scalar_mul(ulong4 k,
     ulong4 Gy = SECP256K1_GY;
     
     // Process words from MSB to LSB (word 3 → 2 → 1 → 0)
+    // Total: 256 iterations (doubles) + ~128 additions (on average)
     for (int word = 3; word >= 0; word--) {
         ulong bits = (word == 3) ? k.w : 
                      ((word == 2) ? k.z : 
                      ((word == 1) ? k.y : k.x));
         
         for (int bit = 0; bit < 64; bit++) {
-            // Double
+            // Double (always executed)
             ext_jac_dbl(out_X, out_Y, out_Z, out_ZZ, out_X, out_Y, out_Z, out_ZZ);
             
-            // Add G if bit is set
+            // Add G if bit is set (causes warp divergence - see note above)
             if ((bits >> (63 - bit)) & 1) {
                 ext_jac_add_affine(out_X, out_Y, out_Z, out_ZZ, Gx, Gy, 
                                    out_X, out_Y, out_Z, out_ZZ);
