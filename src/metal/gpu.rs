@@ -218,6 +218,13 @@ impl GpuBrainwallet {
         
         let count = passphrases.len().min(self.tier.threads_per_dispatch);
         
+        // Zero output buffer to prevent stale data (defensive programming)
+        // Only zero the region we'll actually use
+        unsafe {
+            let output_ptr = self.output_buffer.contents() as *mut u8;
+            std::ptr::write_bytes(output_ptr, 0, count * OUTPUT_SIZE);
+        }
+        
         // Copy passphrases to input buffer with 16-byte aligned header
         // Format: [length:1][padding:15][data:128] = 144 bytes per passphrase
         unsafe {
@@ -276,7 +283,11 @@ impl GpuBrainwallet {
         // Check for errors
         let status = command_buffer.status();
         if status == metal::MTLCommandBufferStatus::Error {
-            return Err("GPU command buffer failed".to_string());
+            return Err(format!(
+                "GPU command buffer failed (status: {:?}). \
+                 Possible causes: shader error, buffer overflow, or GPU timeout.",
+                status
+            ));
         }
         
         // Read results
@@ -371,7 +382,10 @@ impl GpuBrainwallet {
         
         let status = command_buffer.status();
         if status == metal::MTLCommandBufferStatus::Error {
-            return Err("GPU command buffer failed".to_string());
+            return Err(format!(
+                "GPU command buffer failed (status: {:?})",
+                status
+            ));
         }
         
         self.total_processed.fetch_add(count as u64, Ordering::Relaxed);

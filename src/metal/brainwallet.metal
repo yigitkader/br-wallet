@@ -41,6 +41,33 @@ constant ulong4 SECP256K1_N = {
     0xFFFFFFFFFFFFFFFEULL, 0xFFFFFFFFFFFFFFFFULL
 };
 
+// Check if value >= N (curve order)
+// Returns true if a >= SECP256K1_N
+inline bool ge_curve_order(ulong4 a) {
+    if (a.w > SECP256K1_N.w) return true;
+    if (a.w < SECP256K1_N.w) return false;
+    if (a.z > SECP256K1_N.z) return true;
+    if (a.z < SECP256K1_N.z) return false;
+    if (a.y > SECP256K1_N.y) return true;
+    if (a.y < SECP256K1_N.y) return false;
+    return a.x >= SECP256K1_N.x;
+}
+
+// Reduce scalar modulo curve order N (for BIP341 Taproot tweak)
+// If scalar >= N, subtract N
+inline ulong4 mod_n_reduce(ulong4 a) {
+    if (!ge_curve_order(a)) return a;
+    
+    // a - N (guaranteed no underflow since a >= N)
+    ulong4 r;
+    ulong bw = 0;
+    r.x = a.x - SECP256K1_N.x; bw = (a.x < SECP256K1_N.x) ? 1 : 0;
+    r.y = a.y - SECP256K1_N.y - bw; bw = (a.y < SECP256K1_N.y + bw) ? 1 : 0;
+    r.z = a.z - SECP256K1_N.z - bw; bw = (a.z < SECP256K1_N.z + bw) ? 1 : 0;
+    r.w = a.w - SECP256K1_N.w - bw;
+    return r;
+}
+
 constant ulong4 SECP256K1_GX = {
     0x59F2815B16F81798ULL, 0x029BFCDB2DCE28D9ULL,
     0x55A06295CE870B07ULL, 0x79BE667EF9DCBBACULL
@@ -857,16 +884,11 @@ kernel void process_brainwallet_batch(
     
     // Step 2: Validate private key (must be < curve order and non-zero)
     ulong4 k = load_be(priv_key);
-    bool is_zero = IsZero(k);
-    bool ge_order = k.w > SECP256K1_N.w || 
-        (k.w == SECP256K1_N.w && k.z > SECP256K1_N.z) ||
-        (k.w == SECP256K1_N.w && k.z == SECP256K1_N.z && k.y > SECP256K1_N.y) ||
-        (k.w == SECP256K1_N.w && k.z == SECP256K1_N.z && k.y == SECP256K1_N.y && k.x >= SECP256K1_N.x);
-    
     uint out_offset = gid * OUTPUT_SIZE;
     
-    if (is_zero || ge_order) {
-        // Invalid key - zero output
+    if (IsZero(k) || ge_curve_order(k)) {
+        // Invalid key (k=0 or k>=N) - zero output
+        // Note: Probability of SHA256 >= N is ~1/2^128, essentially never happens
         for (int i = 0; i < OUTPUT_SIZE; i++) {
             output[out_offset + i] = 0;
         }
@@ -927,8 +949,10 @@ kernel void process_brainwallet_batch(
     uchar tweak_bytes[32];
     taptweak_hash(x_only, tweak_bytes);
     
-    // Convert tweak to scalar
+    // Convert tweak to scalar and reduce mod N (BIP341 compliance)
+    // Note: Probability of tweak >= N is ~1/2^128, but must handle for correctness
     ulong4 tweak_scalar = load_be(tweak_bytes);
+    tweak_scalar = mod_n_reduce(tweak_scalar);
     
     // BIP340: For x-only pubkey, we need y to be even
     // If y is odd (LSB = 1), negate it: y = p - y

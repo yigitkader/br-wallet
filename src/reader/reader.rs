@@ -22,6 +22,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex,
 };
+use std::time::{Duration, Instant};
 
 /// Adaptive sampling ile satır sayısını tahmin eder
 ///
@@ -132,6 +133,10 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
 
     let counter = AtomicU64::new(0);
     let mut batcher = PassphraseBatcher::new(&mmap, batch_size);
+    
+    // Throttled progress updates (every 100ms max)
+    let mut last_pb_update = Instant::now();
+    const PB_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
     // Main GPU processing loop
     while let Some(batch) = batcher.next_batch() {
@@ -200,10 +205,12 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
             let _ = f.flush();
         }
 
-        // Update progress
+        // Update progress with throttling (max once per 100ms)
         let current = counter.fetch_add(batch_len as u64, Ordering::Relaxed);
-        if current % 10_000 < batch_len as u64 {
+        let now = Instant::now();
+        if now.duration_since(last_pb_update) >= PB_UPDATE_INTERVAL {
             pb.set_position(current + batch_len as u64);
+            last_pb_update = now;
         }
     }
 
@@ -277,8 +284,9 @@ fn format_ltc_match(result: &BrainwalletResult, pass: &str) -> String {
 }
 
 /// Format Ethereum match - address from GPU Keccak256
+/// Uses EIP-55 checksum encoding for proper address formatting
 fn format_eth_match(result: &BrainwalletResult, pass: &str) -> String {
-    let eth_addr_hex = format!("0x{}", hex::encode(&result.eth_addr));
+    let eth_addr_checksum = to_checksum_address(&result.eth_addr);
     let priv_hex = hex::encode(&result.priv_key);
 
     format!(
@@ -287,8 +295,45 @@ fn format_eth_match(result: &BrainwalletResult, pass: &str) -> String {
          Address: {}\n\
          Private Key: {}\n\
          ========================\n\n",
-        pass, eth_addr_hex, priv_hex
+        pass, eth_addr_checksum, priv_hex
     )
+}
+
+/// EIP-55 Mixed-case checksum address encoding
+/// https://eips.ethereum.org/EIPS/eip-55
+#[inline]
+fn to_checksum_address(addr: &[u8; 20]) -> String {
+    use tiny_keccak::{Hasher, Keccak};
+    
+    let addr_hex = hex::encode(addr);
+    
+    // Keccak256 of lowercase hex string (without 0x prefix)
+    let mut hasher = Keccak::v256();
+    hasher.update(addr_hex.as_bytes());
+    let mut hash = [0u8; 32];
+    hasher.finalize(&mut hash);
+    
+    // Apply checksum: uppercase if corresponding hash nibble >= 8
+    let mut checksum = String::with_capacity(42);
+    checksum.push_str("0x");
+    
+    for (i, c) in addr_hex.chars().enumerate() {
+        if c.is_ascii_digit() {
+            checksum.push(c);
+        } else {
+            // Get corresponding nibble from hash
+            let hash_byte = hash[i / 2];
+            let hash_nibble = if i % 2 == 0 { hash_byte >> 4 } else { hash_byte & 0x0F };
+            
+            if hash_nibble >= 8 {
+                checksum.push(c.to_ascii_uppercase());
+            } else {
+                checksum.push(c); // already lowercase from hex::encode
+            }
+        }
+    }
+    
+    checksum
 }
 
 /// Compute WIF from GPU-provided private key

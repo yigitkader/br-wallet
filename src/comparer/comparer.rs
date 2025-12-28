@@ -19,8 +19,14 @@ const CACHE_HEADER_SIZE: usize = 16;
 
 /// Threshold for switching from HashSet to sorted binary search
 /// Above this count, binary search saves significant RAM
-/// 1 million addresses * 20 bytes = 20MB data, but HashSet adds ~30-40 bytes overhead per entry
-const LARGE_DATASET_THRESHOLD: usize = 5_000_000;
+/// 
+/// RAM comparison at 1M addresses:
+/// - HashSet: 1M * (20 bytes data + ~40 bytes overhead) = ~60MB
+/// - Sorted mmap: 1M * 20 bytes = 20MB (zero-copy from disk)
+/// 
+/// Trade-off: O(1) lookup (HashSet) vs O(log n) lookup (binary search)
+/// At 1M entries, binary search is ~20 comparisons which is still fast
+const LARGE_DATASET_THRESHOLD: usize = 1_000_000;
 
 /// Memory-efficient sorted lookup for large datasets
 /// Uses mmap directly with binary search - zero additional RAM allocation
