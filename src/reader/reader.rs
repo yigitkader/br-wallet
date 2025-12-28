@@ -168,7 +168,7 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
                 
                 let mut rep = String::new();
                 
-                // Check Bitcoin (zero-copy hash access)
+                // Check Bitcoin - Primary keypair (zero-copy hash access)
                 if comparer.btc_on {
                     if comparer.btc_20.contains(raw.h160_c())
                         || comparer.btc_20.contains(raw.h160_u())
@@ -177,11 +177,17 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
                     {
                         let result = raw.to_owned(passphrase);
                         let pass = String::from_utf8_lossy(passphrase);
-                        rep.push_str(&format_btc_match(&result, &pass));
+                        rep.push_str(&format_btc_match(&result, &pass, false));
+                    }
+                    // Check Bitcoin - GLV keypair (FREE 2x throughput!)
+                    else if comparer.btc_20.contains(raw.glv_h160_c()) {
+                        let result = raw.to_owned(passphrase);
+                        let pass = String::from_utf8_lossy(passphrase);
+                        rep.push_str(&format_btc_match(&result, &pass, true));
                     }
                 }
 
-                // Check Litecoin (zero-copy hash access)
+                // Check Litecoin - Primary keypair (zero-copy hash access)
                 if comparer.ltc_on {
                     if comparer.ltc_20.contains(raw.h160_c())
                         || comparer.ltc_20.contains(raw.h160_u())
@@ -190,16 +196,28 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
                     {
                         let result = raw.to_owned(passphrase);
                         let pass = String::from_utf8_lossy(passphrase);
-                        rep.push_str(&format_ltc_match(&result, &pass));
+                        rep.push_str(&format_ltc_match(&result, &pass, false));
+                    }
+                    // Check Litecoin - GLV keypair (FREE 2x throughput!)
+                    else if comparer.ltc_20.contains(raw.glv_h160_c()) {
+                        let result = raw.to_owned(passphrase);
+                        let pass = String::from_utf8_lossy(passphrase);
+                        rep.push_str(&format_ltc_match(&result, &pass, true));
                     }
                 }
 
-                // Check Ethereum (zero-copy hash access)
+                // Check Ethereum - Primary keypair (zero-copy hash access)
                 if comparer.eth_on {
                     if comparer.eth_20.contains(raw.eth_addr()) {
                         let result = raw.to_owned(passphrase);
                         let pass = String::from_utf8_lossy(passphrase);
-                        rep.push_str(&format_eth_match(&result, &pass));
+                        rep.push_str(&format_eth_match(&result, &pass, false));
+                    }
+                    // Check Ethereum - GLV keypair (FREE 2x throughput!)
+                    else if comparer.eth_20.contains(raw.glv_eth_addr()) {
+                        let result = raw.to_owned(passphrase);
+                        let pass = String::from_utf8_lossy(passphrase);
+                        rep.push_str(&format_eth_match(&result, &pass, true));
                     }
                 }
                 
@@ -245,69 +263,129 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
 // FORMATTING FUNCTIONS - All use GPU-computed values (NO recomputation!)
 // ============================================================================
 
+/// GLV endomorphism lambda constant
+/// λ = 0x5363ad4cc05c30e0a5261c028812645a122e22ea20816678df02967c1b23bd72
+const GLV_LAMBDA: [u8; 32] = [
+    0x53, 0x63, 0xad, 0x4c, 0xc0, 0x5c, 0x30, 0xe0,
+    0xa5, 0x26, 0x1c, 0x02, 0x88, 0x12, 0x64, 0x5a,
+    0x12, 0x2e, 0x22, 0xea, 0x20, 0x81, 0x66, 0x78,
+    0xdf, 0x02, 0x96, 0x7c, 0x1b, 0x23, 0xbd, 0x72,
+];
+
+/// Compute GLV private key: (λ * k) mod n
+/// This gives the private key for the GLV-derived address
+#[inline]
+fn compute_glv_privkey(priv_key: &[u8; 32]) -> [u8; 32] {
+    // Use k256 for modular multiplication
+    use k256::elliptic_curve::scalar::ScalarPrimitive;
+    use k256::Secp256k1;
+    
+    // Parse original private key as scalar
+    let k_primitive: ScalarPrimitive<Secp256k1> = match ScalarPrimitive::from_slice(priv_key) {
+        Ok(s) => s,
+        Err(_) => return [0u8; 32], // Invalid key
+    };
+    let k = k256::Scalar::from(&k_primitive);
+    
+    // Parse lambda as scalar
+    let lambda_primitive: ScalarPrimitive<Secp256k1> = match ScalarPrimitive::from_slice(&GLV_LAMBDA) {
+        Ok(s) => s,
+        Err(_) => return [0u8; 32],
+    };
+    let lambda = k256::Scalar::from(&lambda_primitive);
+    
+    // GLV key = (λ * k) mod n
+    let glv_scalar = lambda * k;
+    
+    // Convert back to bytes
+    let mut result = [0u8; 32];
+    result.copy_from_slice(&glv_scalar.to_bytes());
+    result
+}
+
 /// Format Bitcoin match - all values from GPU
-fn format_btc_match(result: &BrainwalletResult, pass: &str) -> String {
-    let wif = compute_wif(&result.priv_key, 0x80, true);
+/// If is_glv is true, computes the correct GLV private key
+fn format_btc_match(result: &BrainwalletResult, pass: &str, is_glv: bool) -> String {
+    let priv_key = if is_glv {
+        compute_glv_privkey(&result.priv_key)
+    } else {
+        result.priv_key
+    };
+    
+    let wif = compute_wif(&priv_key, 0x80, true);
     let hrp = bech32::Hrp::parse("bc").unwrap();
+    
+    let match_type = if is_glv { "BITCOIN GLV MATCH" } else { "BITCOIN MATCH" };
+    let h160 = if is_glv { &result.glv_h160_c } else { &result.h160_c };
 
     format!(
-        "=== BITCOIN MATCH ===\n\
+        "=== {} ===\n\
          Passphrase: {}\n\
          WIF: {}\n\
-         Legacy (1...):      {}\n\
-         Legacy Uncomp:      {}\n\
-         P2SH-SegWit (3...): {}\n\
-         Native SegWit:      {}\n\
-         Taproot:            {}\n\
+         Address (compressed): {}\n\
+         Native SegWit:        {}\n\
          =====================\n\n",
+        match_type,
         pass,
         wif,
-        to_base58check(0x00, &result.h160_c),
-        to_base58check(0x00, &result.h160_u),
-        to_base58check(0x05, &result.h160_nested),
-        bech32::segwit::encode(hrp, bech32::segwit::VERSION_0, &result.h160_c).unwrap_or_default(),
-        bech32::segwit::encode(hrp, bech32::segwit::VERSION_1, &result.taproot).unwrap_or_default(),
+        to_base58check(0x00, h160),
+        bech32::segwit::encode(hrp, bech32::segwit::VERSION_0, h160).unwrap_or_default(),
     )
 }
 
 /// Format Litecoin match - all values from GPU
-fn format_ltc_match(result: &BrainwalletResult, pass: &str) -> String {
-    let wif = compute_wif(&result.priv_key, 0xB0, true);
+/// If is_glv is true, computes the correct GLV private key
+fn format_ltc_match(result: &BrainwalletResult, pass: &str, is_glv: bool) -> String {
+    let priv_key = if is_glv {
+        compute_glv_privkey(&result.priv_key)
+    } else {
+        result.priv_key
+    };
+    
+    let wif = compute_wif(&priv_key, 0xB0, true);
     let hrp = bech32::Hrp::parse("ltc").unwrap();
+    
+    let match_type = if is_glv { "LITECOIN GLV MATCH" } else { "LITECOIN MATCH" };
+    let h160 = if is_glv { &result.glv_h160_c } else { &result.h160_c };
 
     format!(
-        "=== LITECOIN MATCH ===\n\
+        "=== {} ===\n\
          Passphrase: {}\n\
          WIF: {}\n\
-         Legacy (L...):      {}\n\
-         Legacy Uncomp:      {}\n\
-         P2SH-SegWit (M...): {}\n\
-         Native SegWit:      {}\n\
-         Taproot:            {}\n\
+         Address (compressed): {}\n\
+         Native SegWit:        {}\n\
          ======================\n\n",
+        match_type,
         pass,
         wif,
-        to_base58check(0x30, &result.h160_c),   // LTC P2PKH
-        to_base58check(0x30, &result.h160_u),
-        to_base58check(0x32, &result.h160_nested), // LTC P2SH
-        bech32::segwit::encode(hrp, bech32::segwit::VERSION_0, &result.h160_c).unwrap_or_default(),
-        bech32::segwit::encode(hrp, bech32::segwit::VERSION_1, &result.taproot).unwrap_or_default(),
+        to_base58check(0x30, h160),
+        bech32::segwit::encode(hrp, bech32::segwit::VERSION_0, h160).unwrap_or_default(),
     )
 }
 
 /// Format Ethereum match - address from GPU Keccak256
 /// Uses EIP-55 checksum encoding for proper address formatting
-fn format_eth_match(result: &BrainwalletResult, pass: &str) -> String {
-    let eth_addr_checksum = to_checksum_address(&result.eth_addr);
-    let priv_hex = hex::encode(&result.priv_key);
+/// If is_glv is true, computes the correct GLV private key
+fn format_eth_match(result: &BrainwalletResult, pass: &str, is_glv: bool) -> String {
+    let priv_key = if is_glv {
+        compute_glv_privkey(&result.priv_key)
+    } else {
+        result.priv_key
+    };
+    
+    let eth_addr = if is_glv { &result.glv_eth_addr } else { &result.eth_addr };
+    let eth_addr_checksum = to_checksum_address(eth_addr);
+    let priv_hex = hex::encode(&priv_key);
+    
+    let match_type = if is_glv { "ETHEREUM GLV MATCH" } else { "ETHEREUM MATCH" };
 
     format!(
-        "=== ETHEREUM MATCH ===\n\
+        "=== {} ===\n\
          Passphrase: {}\n\
          Address: {}\n\
          Private Key: {}\n\
          ========================\n\n",
-        pass, eth_addr_checksum, priv_hex
+        match_type, pass, eth_addr_checksum, priv_hex
     )
 }
 

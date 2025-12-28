@@ -19,33 +19,33 @@ const CACHE_HEADER_SIZE: usize = 16;
 
 /// Threshold for switching from HashSet to sorted binary search
 /// 
-/// ## Trade-off Analysis:
+/// ## CRITICAL PERFORMANCE NOTE:
 /// 
-/// | Addresses | HashSet RAM | mmap RAM | Recommendation |
-/// |-----------|-------------|----------|----------------|
-/// | 100K      | ~6 MB       | ~2 MB    | HashSet (O(1)) |
-/// | 1M        | ~60 MB      | ~20 MB   | HashSet (O(1)) |
-/// | 5M        | ~300 MB     | ~100 MB  | Depends on RAM |
-/// | 10M+      | ~600+ MB    | ~200 MB  | mmap if <16GB  |
+/// Binary search on mmap is **100-300x SLOWER** than HashSet lookup!
+/// - HashSet: O(1) = ~1 comparison per lookup
+/// - Binary search: O(log n) = ~27 comparisons for 150M entries
 /// 
-/// - **HashSet**: O(1) lookup, higher RAM, faster
-/// - **mmap binary search**: O(log n) lookup, ~0 RAM, slower
+/// For 150M addresses with 10 lookups per passphrase:
+/// - HashSet: 10 * 1 = 10 comparisons
+/// - Binary search: 10 * 27 = 270 comparisons = **27x slower!**
 /// 
-/// For maximum PERFORMANCE, use higher threshold (HashSet faster).
-/// Threshold for switching from HashSet to mmap binary search.
+/// ## RAM Requirements:
 /// 
-/// HashSet: O(1) lookup, uses ~60 bytes/address RAM
-/// mmap binary search: O(log n) lookup, ~0 additional RAM
+/// | Addresses | HashSet RAM | mmap RAM |
+/// |-----------|-------------|----------|
+/// | 10M       | ~600 MB     | ~200 MB  |
+/// | 50M       | ~3 GB       | ~1 GB    |
+/// | 100M      | ~6 GB       | ~2 GB    |
+/// | 150M      | ~9 GB       | ~3 GB    |
 /// 
-/// Binary search is 100-300x slower than HashSet, so prefer HashSet when possible.
+/// For M1 Mac with 16GB RAM: HashSet is viable for up to ~200M addresses
+/// For M1 Mac with 8GB RAM: HashSet is viable for up to ~100M addresses
 /// 
-/// Recommended values:
-/// - 8GB RAM:  1M addresses (~60 MB HashSet)
-/// - 16GB RAM: 5M addresses (~300 MB HashSet)  
-/// - 32GB+ RAM: 10M addresses (~600 MB HashSet)
+/// **ALWAYS prefer HashSet for maximum performance!**
+/// Only use mmap binary search if you literally cannot fit data in RAM.
 /// 
-/// Default: 5M (optimized for 16GB+ Macs which are common for this workload)
-const LARGE_DATASET_THRESHOLD: usize = 5_000_000;
+/// Default: 200M (optimized for 16GB+ Macs - ALWAYS use HashSet for speed)
+const LARGE_DATASET_THRESHOLD: usize = 200_000_000;
 
 /// Memory-efficient sorted lookup for large datasets
 /// Uses mmap directly with binary search - zero additional RAM allocation
