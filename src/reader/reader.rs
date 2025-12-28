@@ -20,16 +20,35 @@ fn estimate_line_count(file_size: u64) -> u64 {
     file_size / AVG_LINE_LENGTH
 }
 
-/// Sadece Windows satır sonu karakterini temizler (\r)
-/// NOT: Boşluk ve tab karakterleri brainwallet passphrase'inin parçası olabilir!
+/// Satır temizleme: CRLF/LF ve leading/trailing whitespace
+/// 
+/// Wordlist dosyalarında genellikle:
+/// - Windows CRLF (\r\n) veya Unix LF (\n) satır sonları
+/// - Yanlışlıkla eklenen boşluk/tab karakterleri olabilir
+/// 
+/// Brainwallet passphrases genellikle trim edilmiş formatta kullanılır.
 #[inline(always)]
-fn strip_cr(line: &[u8]) -> &[u8] {
-    // Sadece sondaki \r karakterini temizle (Windows CRLF uyumu)
-    if line.ends_with(b"\r") {
-        &line[..line.len() - 1]
-    } else {
-        line
+fn clean_line(line: &[u8]) -> &[u8] {
+    let mut l = line;
+    
+    // Strip line endings (CRLF, LF, CR)
+    if l.ends_with(b"\r\n") {
+        l = &l[..l.len() - 2];
+    } else if l.ends_with(b"\n") || l.ends_with(b"\r") {
+        l = &l[..l.len() - 1];
     }
+    
+    // Trim leading whitespace (space, tab)
+    while !l.is_empty() && (l[0] == b' ' || l[0] == b'\t') {
+        l = &l[1..];
+    }
+    
+    // Trim trailing whitespace (space, tab)
+    while !l.is_empty() && (l[l.len() - 1] == b' ' || l[l.len() - 1] == b'\t') {
+        l = &l[..l.len() - 1];
+    }
+    
+    l
 }
 
 /// GPU-accelerated cracking (when gpu feature is enabled)
@@ -270,7 +289,7 @@ fn start_cracking_cpu(dict: &str, comparer: &Comparer) {
 
     mmap.par_split(|&b| b == b'\n').for_each(|raw_line| {
         // Sadece Windows \r karakterini temizle (boşluklar passphrase parçası!)
-        let line = strip_cr(raw_line);
+        let line = clean_line(raw_line);
         
         if line.is_empty() {
             return;

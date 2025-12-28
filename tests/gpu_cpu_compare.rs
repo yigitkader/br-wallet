@@ -51,10 +51,11 @@ fn test_gpu_vs_cpu_hash_comparison() {
             
             let pass_str = String::from_utf8_lossy(passphrase);
             
-            // Compare hashes
+            // Compare ALL hashes including TAPROOT
             let h160_c_match = gpu_result.h160_c == cpu_btc.h160_c;
             let h160_u_match = gpu_result.h160_u == cpu_btc.h160_u;
             let h160_nested_match = gpu_result.h160_nested == cpu_btc.h160_nested;
+            let taproot_match = gpu_result.taproot == cpu_btc.taproot;
             
             println!("Passphrase: '{}'", pass_str);
             println!("  CPU h160_c: {}", hex::encode(&cpu_btc.h160_c));
@@ -72,12 +73,18 @@ fn test_gpu_vs_cpu_hash_comparison() {
                 hex::encode(&gpu_result.h160_nested),
                 if h160_nested_match { "✓" } else { "✗ MISMATCH" }
             );
+            println!("  CPU taproot: {}", hex::encode(&cpu_btc.taproot));
+            println!("  GPU taproot: {} {}", 
+                hex::encode(&gpu_result.taproot),
+                if taproot_match { "✓" } else { "✗ MISMATCH" }
+            );
             println!();
             
-            // Assert matches
+            // Assert ALL matches including TAPROOT
             assert!(h160_c_match, "h160_c mismatch for '{}'", pass_str);
             assert!(h160_u_match, "h160_u mismatch for '{}'", pass_str);
             assert!(h160_nested_match, "h160_nested mismatch for '{}'", pass_str);
+            assert!(taproot_match, "TAPROOT mismatch for '{}'", pass_str);
         }
     }
     let cpu_time = cpu_start.elapsed();

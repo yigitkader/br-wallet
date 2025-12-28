@@ -177,9 +177,21 @@ impl<'a> PassphraseBatcher<'a> {
                 end += 1;
             }
             
-            // Get line (strip \r if present)
+            // Get line and clean it
             let mut line = &self.data[start..end];
+            
+            // Strip line endings (CRLF, CR)
             if line.ends_with(b"\r") {
+                line = &line[..line.len() - 1];
+            }
+            
+            // Trim leading whitespace
+            while !line.is_empty() && (line[0] == b' ' || line[0] == b'\t') {
+                line = &line[1..];
+            }
+            
+            // Trim trailing whitespace
+            while !line.is_empty() && (line[line.len() - 1] == b' ' || line[line.len() - 1] == b'\t') {
                 line = &line[..line.len() - 1];
             }
             

@@ -764,20 +764,93 @@ kernel void process_brainwallet_batch(
     uchar h160_nested[20];
     hash160_22(witness_script, h160_nested);
     
-    // Step 9: Taproot output key (BIP341)
+    // Step 9: Taproot output key (BIP341) - FULL IMPLEMENTATION
+    // Output key Q = P + t*G where:
+    //   P = internal key (x-only pubkey with even y per BIP340)
+    //   t = tagged_hash("TapTweak", P)
+    //   G = generator point
+    
     // Internal key = x-only pubkey (32 bytes)
     uchar x_only[32];
     store_be(ax, x_only);
     
-    // TapTweak hash
-    uchar tweak[32];
-    taptweak_hash(x_only, tweak);
+    // t = TapTweak hash
+    uchar tweak_bytes[32];
+    taptweak_hash(x_only, tweak_bytes);
     
-    // For simplicity, we just use the x_only as taproot output
-    // (Full BIP341 requires point addition with tweak*G)
+    // Convert tweak to scalar
+    ulong4 tweak_scalar = load_be(tweak_bytes);
+    
+    // BIP340: For x-only pubkey, we need y to be even
+    // If y is odd (LSB = 1), negate it: y = p - y
+    ulong4 Py = ay;
+    if (ay.x & 1) {
+        // y is odd, negate it: Py = p - ay
+        Py = mod_sub(SECP256K1_P, ay);
+    }
+    
+    // Compute t*G (tweak point)
+    ulong4 tGx, tGy, tGz, tGzz;
+    scalar_mul(tweak_scalar, tGx, tGy, tGz, tGzz);
+    
+    // Convert t*G to affine
+    ulong4 tGz_inv = mod_inv(tGz);
+    ulong4 tGz_inv2 = mod_sqr(tGz_inv);
+    ulong4 tGz_inv3 = mod_mul(tGz_inv2, tGz_inv);
+    ulong4 tGx_aff = mod_mul(tGx, tGz_inv2);
+    ulong4 tGy_aff = mod_mul(tGy, tGz_inv3);
+    
+    // P = (ax, Py) - internal key with even y
+    // Q = P + t*G using affine point addition
+    
+    // Check if P == t*G (edge case - would need point doubling)
+    bool same_x = (ax.x == tGx_aff.x && ax.y == tGx_aff.y && 
+                   ax.z == tGx_aff.z && ax.w == tGx_aff.w);
+    
+    ulong4 Qx, Qy;
+    bool use_fallback = false;
+    
+    if (same_x) {
+        // Points have same x - either equal or inverse
+        bool same_y = (Py.x == tGy_aff.x && Py.y == tGy_aff.y &&
+                      Py.z == tGy_aff.z && Py.w == tGy_aff.w);
+        if (same_y) {
+            // Point doubling: Q = 2P
+            ulong4 s_num = mod_mul(ax, ax);
+            s_num = mod_add(s_num, mod_add(s_num, s_num)); // 3x^2
+            ulong4 s_den = mod_add(Py, Py);                 // 2y
+            ulong4 s = mod_mul(s_num, mod_inv(s_den));
+            
+            Qx = mod_sub(mod_sqr(s), mod_add(ax, ax));
+            Qy = mod_sub(mod_mul(s, mod_sub(ax, Qx)), Py);
+        } else {
+            // Inverse points - result is infinity (shouldn't happen)
+            use_fallback = true;
+        }
+    } else {
+        // Standard affine point addition: Q = P + t*G
+        // slope = (tGy - Py) / (tGx - Px)
+        ulong4 dy = mod_sub(tGy_aff, Py);
+        ulong4 dx = mod_sub(tGx_aff, ax);
+        ulong4 dx_inv = mod_inv(dx);
+        ulong4 slope = mod_mul(dy, dx_inv);
+        
+        // Qx = slope^2 - Px - tGx
+        ulong4 slope2 = mod_sqr(slope);
+        Qx = mod_sub(mod_sub(slope2, ax), tGx_aff);
+        
+        // Qy = slope * (Px - Qx) - Py
+        Qy = mod_sub(mod_mul(slope, mod_sub(ax, Qx)), Py);
+    }
+    
+    // Output taproot key
     uchar taproot[32];
-    for (int i = 0; i < 32; i++) {
-        taproot[i] = x_only[i];
+    if (use_fallback) {
+        // Fallback to internal key (edge case)
+        for (int i = 0; i < 32; i++) taproot[i] = x_only[i];
+    } else {
+        // Output = Qx (x-only, 32 bytes)
+        store_be(Qx, taproot);
     }
     
     // Write output: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) = 92 bytes
