@@ -11,3 +11,5 @@
 /dist
 /build
 .env
+
+/src/metal-referance

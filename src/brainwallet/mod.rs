@@ -3,6 +3,12 @@ pub mod ethereum;
 pub mod litecoin;
 pub mod solana;
 
+// Re-export wallet types for convenience
+pub use bitcoin::BtcWallet;
+pub use litecoin::LtcWallet;
+pub use ethereum::EthWallet;
+pub use solana::SolWallet;
+
 use sha2::{Digest, Sha256};
 
 pub struct MultiWallet {

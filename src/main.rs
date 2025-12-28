@@ -2,6 +2,9 @@ mod brainwallet;
 mod comparer;
 mod reader;
 
+#[cfg(feature = "gpu")]
+mod metal;
+
 fn main() {
     println!("--- Universal Blockchain Brainwallet Cracker v2.2 ---");
     println!("Ağlar: Bitcoin, Litecoin, Ethereum, Solana\n");
