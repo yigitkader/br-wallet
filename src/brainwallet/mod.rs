@@ -1,13 +1,11 @@
 pub mod bitcoin;
 pub mod ethereum;
 pub mod litecoin;
-pub mod solana;
 
 // Re-export wallet types for convenience
 pub use bitcoin::BtcWallet;
 pub use litecoin::LtcWallet;
 pub use ethereum::EthWallet;
-pub use solana::SolWallet;
 
 use sha2::{Digest, Sha256};
 
@@ -15,7 +13,6 @@ pub struct MultiWallet {
     pub btc: Option<bitcoin::BtcWallet>,
     pub ltc: Option<litecoin::LtcWallet>,
     pub eth: Option<ethereum::EthWallet>,
-    pub sol: Option<solana::SolWallet>,
 }
 
 impl MultiWallet {
@@ -25,7 +22,6 @@ impl MultiWallet {
         btc_on: bool,
         ltc_on: bool,
         eth_on: bool,
-        sol_on: bool,
     ) -> Self {
         // SHA256 işlemini sadece bir kez yapıyoruz (Optimizasyon)
         let priv_hash = Sha256::digest(passphrase);
@@ -33,7 +29,6 @@ impl MultiWallet {
         priv_bytes.copy_from_slice(&priv_hash);
 
         Self {
-            // BTC, LTC ve ETH generate artık Option döner (geçersiz key için None)
             btc: if btc_on {
                 bitcoin::BtcWallet::generate(priv_bytes)
             } else {
@@ -46,11 +41,6 @@ impl MultiWallet {
             },
             eth: if eth_on {
                 ethereum::EthWallet::generate(priv_bytes)
-            } else {
-                None
-            },
-            sol: if sol_on {
-                Some(solana::SolWallet::generate(priv_bytes))
             } else {
                 None
             },

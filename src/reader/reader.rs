@@ -199,19 +199,6 @@ fn try_gpu_cracking(dict: &str, comparer: &Comparer) -> Result<(), String> {
                     }
                 }
                 
-                // For Solana, we still need CPU (Ed25519 derivation)
-                if comparer.sol_on {
-                    let w = MultiWallet::generate_active(
-                        &result.passphrase,
-                        false, false, false, true,
-                    );
-                    if let Some(sol) = w.sol {
-                        if comparer.sol_32.contains(&sol.address) {
-                            rep.push_str(&sol.get_report(&pass));
-                        }
-                    }
-                }
-                
                 if rep.is_empty() { None } else { Some(rep) }
             })
             .collect();
@@ -251,16 +238,11 @@ fn try_gpu_cracking(dict: &str, comparer: &Comparer) -> Result<(), String> {
     Ok(())
 }
 
-/// Format GPU match result - uses GPU-computed hashes directly (NO secp256k1 re-computation!)
+/// Format GPU match result - uses GPU-computed hashes directly (NO recomputation!)
 #[cfg(feature = "gpu")]
 fn format_gpu_match(result: &BrainwalletResult, pass: &str, _comparer: &Comparer) -> String {
-    use sha2::{Digest, Sha256};
-    
-    // Compute private key (just SHA256, no secp256k1)
-    let priv_bytes: [u8; 32] = Sha256::digest(&result.passphrase).into();
-    
-    // Compute WIF (compressed) - only SHA256 double hash, no EC operations
-    let wif = compute_wif(&priv_bytes, 0x80, true);
+    // Use GPU-provided private key (NO SHA256 recomputation!)
+    let wif = compute_wif(&result.priv_key, 0x80, true);
     
     // Build addresses from GPU-computed hashes (NO secp256k1!)
     let hrp = bech32::Hrp::parse("bc").unwrap();
@@ -304,16 +286,11 @@ fn to_b58_static(version: u8, hash: &[u8; 20]) -> String {
     bs58::encode(&data).with_check().into_string()
 }
 
-/// Format LTC match result - uses GPU-computed hashes directly (NO secp256k1!)
+/// Format LTC match result - uses GPU-computed hashes directly (NO recomputation!)
 #[cfg(feature = "gpu")]
 fn format_ltc_match(result: &BrainwalletResult, pass: &str) -> String {
-    use sha2::{Digest, Sha256};
-    
-    // Compute private key (just SHA256, no secp256k1)
-    let priv_bytes: [u8; 32] = Sha256::digest(&result.passphrase).into();
-    
-    // Compute WIF (Litecoin version byte 0xB0)
-    let wif = compute_wif(&priv_bytes, 0xB0, true);
+    // Use GPU-provided private key (NO SHA256 recomputation!)
+    let wif = compute_wif(&result.priv_key, 0xB0, true);
     
     // Build addresses from GPU-computed hashes (Litecoin version bytes)
     let hrp = bech32::Hrp::parse("ltc").unwrap();
@@ -388,7 +365,6 @@ fn start_cracking_cpu(dict: &str, comparer: &Comparer) {
             comparer.btc_on,
             comparer.ltc_on,
             comparer.eth_on,
-            comparer.sol_on,
         );
         let pass = String::from_utf8_lossy(line);
         let mut rep = String::new();
@@ -414,11 +390,6 @@ fn start_cracking_cpu(dict: &str, comparer: &Comparer) {
         if let Some(eth) = w.eth {
             if comparer.eth_20.contains(&eth.address) {
                 rep.push_str(&eth.get_report(&pass));
-            }
-        }
-        if let Some(sol) = w.sol {
-            if comparer.sol_32.contains(&sol.address) {
-                rep.push_str(&sol.get_report(&pass));
             }
         }
 

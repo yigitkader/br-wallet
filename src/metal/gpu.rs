@@ -16,7 +16,7 @@ use metal::{
 const SHADER_SOURCE: &str = include_str!("brainwallet.metal");
 
 /// Output size per passphrase: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) = 92 bytes
-pub const OUTPUT_SIZE: usize = 156; // h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + pubkey_u(64)
+pub const OUTPUT_SIZE: usize = 188; // h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + pubkey_u(64) + priv_key(32)
 
 /// Maximum passphrase length
 pub const MAX_PASSPHRASE_LEN: usize = 128;
@@ -33,6 +33,7 @@ pub struct GpuBrainwalletResult {
     pub h160_nested: [u8; 20],  // HASH160(P2SH-P2WPKH script)
     pub taproot: [u8; 32],      // Taproot x-only pubkey
     pub pubkey_u: [u8; 64],     // Uncompressed pubkey (X||Y without 0x04 prefix)
+    pub priv_key: [u8; 32],     // SHA256(passphrase) - private key
 }
 
 impl GpuBrainwalletResult {
@@ -49,6 +50,7 @@ impl GpuBrainwalletResult {
             h160_nested: [0u8; 20],
             taproot: [0u8; 32],
             pubkey_u: [0u8; 64],
+            priv_key: [0u8; 32],
         };
         
         result.h160_c.copy_from_slice(&data[0..20]);
@@ -56,6 +58,7 @@ impl GpuBrainwalletResult {
         result.h160_nested.copy_from_slice(&data[40..60]);
         result.taproot.copy_from_slice(&data[60..92]);
         result.pubkey_u.copy_from_slice(&data[92..156]);
+        result.priv_key.copy_from_slice(&data[156..188]);
         
         Some(result)
     }
@@ -281,6 +284,7 @@ impl GpuBrainwallet {
                         h160_nested: [0u8; 20],
                         taproot: [0u8; 32],
                         pubkey_u: [0u8; 64],
+                        priv_key: [0u8; 32],
                     });
                 }
             }

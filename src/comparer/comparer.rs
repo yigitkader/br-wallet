@@ -21,11 +21,9 @@ pub struct Comparer {
     pub ltc_20: FxHashSet<[u8; 20]>,
     pub ltc_32: FxHashSet<[u8; 32]>,
     pub eth_20: FxHashSet<[u8; 20]>,
-    pub sol_32: FxHashSet<[u8; 32]>,
     pub btc_on: bool,
     pub ltc_on: bool,
     pub eth_on: bool,
-    pub sol_on: bool,
 }
 
 impl Comparer {
@@ -33,12 +31,10 @@ impl Comparer {
         let (btc_20, btc_32) = Self::load_net("bitcoin");
         let (ltc_20, ltc_32) = Self::load_net("litecoin");
         let (eth_20, _) = Self::load_net("ethereum");
-        let (_, sol_32) = Self::load_net("solana");
 
         let btc_count = btc_20.len() + btc_32.len();
         let ltc_count = ltc_20.len() + ltc_32.len();
         let eth_count = eth_20.len();
-        let sol_count = sol_32.len();
         
         println!();
         if btc_count > 0 {
@@ -52,21 +48,16 @@ impl Comparer {
         if eth_count > 0 {
             println!("📦 Ethereum: {} adres", eth_count);
         }
-        if sol_count > 0 {
-            println!("📦 Solana: {} adres", sol_count);
-        }
 
         Comparer {
             btc_on: btc_count > 0,
             ltc_on: ltc_count > 0,
             eth_on: eth_count > 0,
-            sol_on: sol_count > 0,
             btc_20,
             btc_32,
             ltc_20,
             ltc_32,
             eth_20,
-            sol_32,
         }
     }
 
@@ -260,13 +251,6 @@ impl Comparer {
                     if let Ok(b) = hex::decode(a.trim_start_matches("0x")) {
                         if let Ok(arr) = <[u8; 20]>::try_from(b.as_slice()) {
                             h20.insert(arr);
-                        }
-                    }
-                }
-                "solana" => {
-                    if let Ok(b) = bs58::decode(a).into_vec() {
-                        if let Ok(arr) = <[u8; 32]>::try_from(b.as_slice()) {
-                            h32.insert(arr);
                         }
                     }
                 }

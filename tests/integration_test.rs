@@ -10,7 +10,6 @@ use sha2::{Digest, Sha256};
 use secp256k1::{Keypair, PublicKey, SecretKey, XOnlyPublicKey, SECP256K1};
 use ripemd::Ripemd160;
 use tiny_keccak::{Hasher, Keccak};
-use ed25519_dalek::SigningKey;
 
 const TEST_PASSPHRASE: &str = "satoshi";
 
@@ -210,18 +209,6 @@ fn test_ethereum_address() {
                "Ethereum address mismatch");
 }
 
-// ==================== SOLANA TESTS ====================
-
-#[test]
-fn test_solana_address() {
-    let priv_bytes = derive_private_key(TEST_PASSPHRASE);
-    let sk = SigningKey::from_bytes(&priv_bytes);
-    let addr = bs58::encode(sk.verifying_key().to_bytes()).into_string();
-    
-    assert_eq!(addr, "zug6MJcfsKzTpUzsyRcEf9mabqyVNLDviwFBzNohQZ5", 
-               "Solana address mismatch");
-}
-
 // ==================== COMPARER TESTS ====================
 
 #[test]
@@ -333,24 +320,6 @@ fn test_comparer_ethereum_parsing() {
     }
 }
 
-#[test]
-fn test_comparer_solana_parsing() {
-    let addr = "zug6MJcfsKzTpUzsyRcEf9mabqyVNLDviwFBzNohQZ5";
-    
-    if let Ok(b) = bs58::decode(addr).into_vec() {
-        if let Ok(arr) = <[u8; 32]>::try_from(b.as_slice()) {
-            // Türetilen adresle karşılaştır
-            let priv_bytes = derive_private_key(TEST_PASSPHRASE);
-            let sk = SigningKey::from_bytes(&priv_bytes);
-            let sol_addr = sk.verifying_key().to_bytes();
-            
-            assert_eq!(arr, sol_addr, "Solana address mismatch");
-        } else {
-            panic!("Failed to parse Solana address");
-        }
-    }
-}
-
 // ==================== END-TO-END MATCHING TEST ====================
 
 #[test]
@@ -405,18 +374,10 @@ fn test_full_matching_flow() {
     let eth_targets: HashSet<[u8; 20]> = [eth_addr].into_iter().collect();
     assert!(eth_targets.contains(&eth_addr), "ETH should match");
     
-    // Solana
-    let sol_sk = SigningKey::from_bytes(&priv_bytes);
-    let sol_addr = sol_sk.verifying_key().to_bytes();
-    
-    let sol_targets: HashSet<[u8; 32]> = [sol_addr].into_iter().collect();
-    assert!(sol_targets.contains(&sol_addr), "SOL should match");
-    
-    println!("✅ All 4 networks matched successfully!");
+    println!("✅ All 3 networks matched successfully!");
     println!("   - Bitcoin: 4 address types (Legacy, Uncomp, P2SH, SegWit, Taproot)");
     println!("   - Litecoin: 4 address types");
     println!("   - Ethereum: 1 address type");
-    println!("   - Solana: 1 address type");
 }
 
 // ==================== HELPER ====================
