@@ -297,6 +297,7 @@ fn compute_glv_privkey(priv_key: &[u8; 32]) -> [u8; 32] {
 
 /// Format Bitcoin match - all values from GPU
 /// If is_glv is true, computes the correct GLV private key
+/// Shows ALL address types that can be derived from this private key
 fn format_btc_match(result: &BrainwalletResult, is_glv: bool) -> String {
     let priv_key = if is_glv {
         compute_glv_privkey(&result.priv_key)
@@ -304,29 +305,64 @@ fn format_btc_match(result: &BrainwalletResult, is_glv: bool) -> String {
         result.priv_key
     };
     
-    let wif = compute_wif(&priv_key, 0x80, true);
     let hrp = bech32::Hrp::parse("bc").unwrap();
-    
     let match_type = if is_glv { "BITCOIN GLV MATCH" } else { "BITCOIN MATCH" };
-    let h160 = if is_glv { &result.glv_h160_c } else { &result.h160_c };
 
-    format!(
-        "=== {} ===\n\
-         Passphrase: {}\n\
-         WIF: {}\n\
-         Address (compressed): {}\n\
-         Native SegWit:        {}\n\
-         =====================\n\n",
-        match_type,
-        result.passphrase_str(),
-        wif,
-        to_base58check(0x00, h160),
-        bech32::segwit::encode(hrp, bech32::segwit::VERSION_0, h160).unwrap_or_default(),
-    )
+    if is_glv {
+        // GLV: only compressed addresses available from GPU
+        let wif_c = compute_wif(&priv_key, 0x80, true);
+        let h160_c = &result.glv_h160_c;
+        
+        // Compute P2SH-P2WPKH from glv_h160_c
+        let h160_nested = compute_p2sh_p2wpkh_hash(h160_c);
+        
+        format!(
+            "=== {} ===\n\
+             Passphrase: {}\n\
+             WIF: {}\n\
+             \n\
+             P2PKH (compressed): {}\n\
+             P2SH-P2WPKH:        {}\n\
+             Native SegWit:      {}\n\
+             =====================\n\n",
+            match_type,
+            result.passphrase_str(),
+            wif_c,
+            to_base58check(0x00, h160_c),
+            to_base58check(0x05, &h160_nested),
+            bech32::segwit::encode(hrp, bech32::segwit::VERSION_0, h160_c).unwrap_or_default(),
+        )
+    } else {
+        // Primary: all address types available
+        let wif_c = compute_wif(&priv_key, 0x80, true);
+        let wif_u = compute_wif(&priv_key, 0x80, false);
+        
+        format!(
+            "=== {} ===\n\
+             Passphrase: {}\n\
+             WIF (compressed):   {}\n\
+             WIF (uncompressed): {}\n\
+             \n\
+             P2PKH (compressed):   {}\n\
+             P2PKH (uncompressed): {}\n\
+             P2SH-P2WPKH:          {}\n\
+             Native SegWit:        {}\n\
+             =====================\n\n",
+            match_type,
+            result.passphrase_str(),
+            wif_c,
+            wif_u,
+            to_base58check(0x00, &result.h160_c),
+            to_base58check(0x00, &result.h160_u),
+            to_base58check(0x05, &result.h160_nested),
+            bech32::segwit::encode(hrp, bech32::segwit::VERSION_0, &result.h160_c).unwrap_or_default(),
+        )
+    }
 }
 
 /// Format Litecoin match - all values from GPU
 /// If is_glv is true, computes the correct GLV private key
+/// Shows ALL address types that can be derived from this private key
 fn format_ltc_match(result: &BrainwalletResult, is_glv: bool) -> String {
     let priv_key = if is_glv {
         compute_glv_privkey(&result.priv_key)
@@ -334,25 +370,59 @@ fn format_ltc_match(result: &BrainwalletResult, is_glv: bool) -> String {
         result.priv_key
     };
     
-    let wif = compute_wif(&priv_key, 0xB0, true);
     let hrp = bech32::Hrp::parse("ltc").unwrap();
-    
     let match_type = if is_glv { "LITECOIN GLV MATCH" } else { "LITECOIN MATCH" };
-    let h160 = if is_glv { &result.glv_h160_c } else { &result.h160_c };
 
-    format!(
-        "=== {} ===\n\
-         Passphrase: {}\n\
-         WIF: {}\n\
-         Address (compressed): {}\n\
-         Native SegWit:        {}\n\
-         ======================\n\n",
-        match_type,
-        result.passphrase_str(),
-        wif,
-        to_base58check(0x30, h160),
-        bech32::segwit::encode(hrp, bech32::segwit::VERSION_0, h160).unwrap_or_default(),
-    )
+    if is_glv {
+        // GLV: only compressed addresses available from GPU
+        let wif_c = compute_wif(&priv_key, 0xB0, true);
+        let h160_c = &result.glv_h160_c;
+        
+        // Compute P2SH-P2WPKH from glv_h160_c
+        let h160_nested = compute_p2sh_p2wpkh_hash(h160_c);
+        
+        format!(
+            "=== {} ===\n\
+             Passphrase: {}\n\
+             WIF: {}\n\
+             \n\
+             P2PKH (compressed): {}\n\
+             P2SH-P2WPKH:        {}\n\
+             Native SegWit:      {}\n\
+             ======================\n\n",
+            match_type,
+            result.passphrase_str(),
+            wif_c,
+            to_base58check(0x30, h160_c),
+            to_base58check(0x32, &h160_nested),
+            bech32::segwit::encode(hrp, bech32::segwit::VERSION_0, h160_c).unwrap_or_default(),
+        )
+    } else {
+        // Primary: all address types available
+        let wif_c = compute_wif(&priv_key, 0xB0, true);
+        let wif_u = compute_wif(&priv_key, 0xB0, false);
+        
+        format!(
+            "=== {} ===\n\
+             Passphrase: {}\n\
+             WIF (compressed):   {}\n\
+             WIF (uncompressed): {}\n\
+             \n\
+             P2PKH (compressed):   {}\n\
+             P2PKH (uncompressed): {}\n\
+             P2SH-P2WPKH:          {}\n\
+             Native SegWit:        {}\n\
+             ======================\n\n",
+            match_type,
+            result.passphrase_str(),
+            wif_c,
+            wif_u,
+            to_base58check(0x30, &result.h160_c),
+            to_base58check(0x30, &result.h160_u),
+            to_base58check(0x32, &result.h160_nested),
+            bech32::segwit::encode(hrp, bech32::segwit::VERSION_0, &result.h160_c).unwrap_or_default(),
+        )
+    }
 }
 
 /// Format Ethereum match - address from GPU Keccak256
@@ -435,4 +505,25 @@ fn to_base58check(version: u8, hash: &[u8; 20]) -> String {
     let mut data = vec![version];
     data.extend_from_slice(hash);
     bs58::encode(&data).with_check().into_string()
+}
+
+/// Compute P2SH-P2WPKH script hash from compressed pubkey hash
+/// Script: OP_0 <20-byte-hash> = 0x00 0x14 || h160
+#[inline]
+fn compute_p2sh_p2wpkh_hash(h160_c: &[u8; 20]) -> [u8; 20] {
+    use ripemd::Ripemd160;
+    use sha2::{Digest, Sha256};
+    
+    let mut script = [0u8; 22];
+    script[0] = 0x00; // OP_0
+    script[1] = 0x14; // Push 20 bytes
+    script[2..22].copy_from_slice(h160_c);
+    
+    // HASH160 = RIPEMD160(SHA256(script))
+    let sha = Sha256::digest(&script);
+    let rip = Ripemd160::digest(&sha);
+    
+    let mut result = [0u8; 20];
+    result.copy_from_slice(&rip);
+    result
 }

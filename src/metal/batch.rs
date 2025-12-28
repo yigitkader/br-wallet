@@ -11,8 +11,12 @@ use super::gpu::{GpuBrainwallet, OUTPUT_SIZE};
 pub struct BrainwalletResult {
     /// Original passphrase used to derive this result
     pub passphrase: Vec<u8>,
-    /// HASH160 of compressed public key (for P2PKH, SegWit)
+    /// HASH160 of compressed public key (for P2PKH compressed, Native SegWit)
     pub h160_c: [u8; 20],
+    /// HASH160 of uncompressed public key (for P2PKH uncompressed)
+    pub h160_u: [u8; 20],
+    /// HASH160 of P2SH-P2WPKH witness script (for 3xxx addresses)
+    pub h160_nested: [u8; 20],
     /// Ethereum address (last 20 bytes of Keccak256)
     pub eth_addr: [u8; 20],
     /// Private key (SHA256 of passphrase)
@@ -99,6 +103,8 @@ impl<'a> RawGpuResult<'a> {
         BrainwalletResult {
             passphrase: passphrase.to_vec(),
             h160_c: *self.h160_c(),
+            h160_u: *self.h160_u(),
+            h160_nested: *self.h160_nested(),
             eth_addr: *self.eth_addr(),
             priv_key: *self.priv_key(),
             glv_h160_c: *self.glv_h160_c(),
