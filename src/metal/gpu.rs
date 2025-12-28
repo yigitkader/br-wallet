@@ -7,10 +7,18 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use std::thread;
 
 use metal::{
     Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
 };
+
+/// GPU command timeout (10 seconds should be plenty for any batch)
+const GPU_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Poll interval when waiting for GPU completion
+const GPU_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Metal shader source - embedded at compile time
 const SHADER_SOURCE: &str = include_str!("brainwallet.metal");
@@ -268,16 +276,30 @@ impl GpuBrainwallet {
         encoder.end_encoding();
         
         command_buffer.commit();
-        command_buffer.wait_until_completed();
         
-        // Check for errors
-        let status = command_buffer.status();
-        if status == metal::MTLCommandBufferStatus::Error {
-            return Err(format!(
-                "GPU command buffer failed (status: {:?}). \
-                 Possible causes: shader error, buffer overflow, or GPU timeout.",
-                status
-            ));
+        // Wait with timeout to prevent infinite blocking
+        let deadline = Instant::now() + GPU_TIMEOUT;
+        loop {
+            let status = command_buffer.status();
+            match status {
+                metal::MTLCommandBufferStatus::Completed => break,
+                metal::MTLCommandBufferStatus::Error => {
+                    return Err(format!(
+                        "GPU command buffer failed (status: {:?}). \
+                         Possible causes: shader error, buffer overflow, or invalid data.",
+                        status
+                    ));
+                }
+                _ => {
+                    if Instant::now() > deadline {
+                        return Err(format!(
+                            "GPU timeout after {:?}. The GPU may be overloaded or the batch too large.",
+                            GPU_TIMEOUT
+                        ));
+                    }
+                    thread::sleep(GPU_POLL_INTERVAL);
+                }
+            }
         }
         
         // Read results
@@ -363,14 +385,30 @@ impl GpuBrainwallet {
         encoder.end_encoding();
         
         command_buffer.commit();
-        command_buffer.wait_until_completed();
         
-        let status = command_buffer.status();
-        if status == metal::MTLCommandBufferStatus::Error {
-            return Err(format!(
-                "GPU command buffer failed (status: {:?})",
-                status
-            ));
+        // Wait with timeout to prevent infinite blocking
+        let deadline = Instant::now() + GPU_TIMEOUT;
+        loop {
+            let status = command_buffer.status();
+            match status {
+                metal::MTLCommandBufferStatus::Completed => break,
+                metal::MTLCommandBufferStatus::Error => {
+                    return Err(format!(
+                        "GPU command buffer failed (status: {:?}). \
+                         Possible causes: shader error, buffer overflow, or invalid data.",
+                        status
+                    ));
+                }
+                _ => {
+                    if Instant::now() > deadline {
+                        return Err(format!(
+                            "GPU timeout after {:?}. The GPU may be overloaded or the batch too large.",
+                            GPU_TIMEOUT
+                        ));
+                    }
+                    thread::sleep(GPU_POLL_INTERVAL);
+                }
+            }
         }
         
         self.total_processed.fetch_add(count as u64, Ordering::Relaxed);
