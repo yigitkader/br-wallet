@@ -134,9 +134,10 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
     let counter = AtomicU64::new(0);
     let mut batcher = PassphraseBatcher::new(&mmap, batch_size);
     
-    // Throttled progress updates (every 100ms max)
+    // Throttled progress updates (every 500ms max)
+    // Higher interval reduces terminal I/O overhead at high throughput (100K+/sec)
     let mut last_pb_update = Instant::now();
-    const PB_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
+    const PB_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
 
     // Main GPU processing loop - ZERO-ALLOCATION MATCHING
     // Only allocate BrainwalletResult when a match is found (99.99%+ don't match)

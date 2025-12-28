@@ -243,14 +243,8 @@ impl GpuBrainwallet {
                     len,
                 );
                 
-                // Zero-pad remaining passphrase area
-                if len < MAX_PASSPHRASE_LEN {
-                    std::ptr::write_bytes(
-                        input_ptr.add(offset + 16 + len),
-                        0,
-                        MAX_PASSPHRASE_LEN - len,
-                    );
-                }
+                // NOTE: No padding needed - shader uses pp_len to determine read length
+                // Metal buffers don't require explicit zeroing for unused regions
             }
             
             // Write count
@@ -346,13 +340,7 @@ impl GpuBrainwallet {
                     len,
                 );
                 
-                if len < MAX_PASSPHRASE_LEN {
-                    std::ptr::write_bytes(
-                        input_ptr.add(offset + 16 + len),
-                        0,
-                        MAX_PASSPHRASE_LEN - len,
-                    );
-                }
+                // NOTE: No padding needed - shader uses pp_len to determine read length
             }
             
             let count_ptr = self.count_buffer.contents() as *mut u32;
