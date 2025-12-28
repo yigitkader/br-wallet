@@ -1,15 +1,27 @@
 // ============================================================================
-// BRAINWALLET GPU SHADER - Ultra-Optimized Metal Implementation
+// BRAINWALLET GPU SHADER - Metal Implementation for Apple Silicon
 //
-// Pipeline: Passphrase → SHA256 → secp256k1 → HASH160 → Output
+// Pipeline: Passphrase → SHA256 → secp256k1 → HASH160/Keccak256 → Output
 //
-// Optimizations:
-// 1. Batch processing (32 passphrases per thread)
-// 2. Montgomery batch inversion (1 mod_inv per batch)
-// 3. Extended Jacobian coordinates
-// 4. Pre-computed wNAF tables for generator multiplication
+// Supported Chains (ALL computed on GPU):
+// - Bitcoin: P2PKH (1...), P2SH-P2WPKH (3...), Native SegWit (bc1q...), Taproot (bc1p...)
+// - Litecoin: Same address types with LTC prefixes
+// - Ethereum: Keccak256-based addresses (0x...) - FULL GPU COMPUTATION!
 //
-// Output per passphrase: [h160_c:20][h160_u:20][h160_nested:20][taproot:32] = 92 bytes
+// Current Optimizations:
+// 1. One passphrase per GPU thread (massively parallel)
+// 2. Extended Jacobian coordinates for EC operations
+// 3. Fermat's Little Theorem modular inversion (a^(p-2) mod p)
+// 4. Double-and-add scalar multiplication
+// 5. Keccak256 on GPU for Ethereum (eliminates CPU bottleneck)
+//
+// TODO - Future optimizations (not yet implemented):
+// - wNAF (Windowed Non-Adjacent Form) for faster scalar multiplication
+// - GLV endomorphism for ~2x EC speedup
+// - Montgomery batch inversion across thread groups
+//
+// Output per passphrase: h160_c(20) + h160_u(20) + h160_nested(20) + 
+//                        taproot(32) + eth_addr(20) + priv_key(32) = 144 bytes
 // ============================================================================
 
 #include <metal_stdlib>
@@ -63,11 +75,16 @@ constant uchar RIPEMD_RR[80] = {5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12,6,11,3,7,0
 constant uchar RIPEMD_SL[80] = {11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8,7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5,11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12,9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6};
 constant uchar RIPEMD_SR[80] = {8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5,15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8,8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11};
 
-// Output size per passphrase: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + pubkey_u(64) + priv_key(32) = 188 bytes
-// pubkey_u is X||Y (without 0x04 prefix) for Ethereum Keccak256 on CPU
+// Output size per passphrase: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32) = 144 bytes
+// eth_addr is computed on GPU using Keccak256 - no CPU post-processing needed!
 // priv_key is the SHA256(passphrase) - avoids recomputation on CPU
-#define OUTPUT_SIZE 188
+#define OUTPUT_SIZE 144
 #define MAX_PASSPHRASE_LEN 128
+
+// Input stride: 16-byte aligned header (1 byte length + 15 padding) + 128 bytes data = 144 bytes
+// This alignment improves GPU memory coalescing performance
+#define PASSPHRASE_HEADER_SIZE 16
+#define PASSPHRASE_STRIDE (PASSPHRASE_HEADER_SIZE + MAX_PASSPHRASE_LEN)
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -393,6 +410,135 @@ void hash160_22(thread const uchar* script, thread uchar* out) {
 }
 
 // ============================================================================
+// KECCAK-256 (Ethereum Address Computation)
+// ============================================================================
+//
+// Keccak-256 is used to derive Ethereum addresses from uncompressed public keys:
+// eth_address = Keccak256(pubkey_x || pubkey_y)[12:32]  (last 20 bytes)
+//
+// Implementation: Keccak-f[1600] with r=1088, c=512 (Keccak-256 parameters)
+//
+
+// Keccak round constants
+constant ulong KECCAK_RC[24] = {
+    0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808aULL,
+    0x8000000080008000ULL, 0x000000000000808bULL, 0x0000000080000001ULL,
+    0x8000000080008081ULL, 0x8000000000008009ULL, 0x000000000000008aULL,
+    0x0000000000000088ULL, 0x0000000080008009ULL, 0x000000008000000aULL,
+    0x000000008000808bULL, 0x800000000000008bULL, 0x8000000000008089ULL,
+    0x8000000000008003ULL, 0x8000000000008002ULL, 0x8000000000000080ULL,
+    0x000000000000800aULL, 0x800000008000000aULL, 0x8000000080008081ULL,
+    0x8000000000008080ULL, 0x0000000080000001ULL, 0x8000000080008008ULL
+};
+
+// Keccak rotation offsets
+constant int KECCAK_ROTC[24] = {
+    1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14,
+    27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44
+};
+
+// Keccak pi lane indices
+constant int KECCAK_PILN[24] = {
+    10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4,
+    15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1
+};
+
+inline ulong rotl64(ulong x, int n) {
+    return (x << n) | (x >> (64 - n));
+}
+
+// Keccak-f[1600] permutation
+void keccakf(thread ulong* st) {
+    for (int round = 0; round < 24; round++) {
+        // Theta
+        ulong bc[5];
+        for (int i = 0; i < 5; i++) {
+            bc[i] = st[i] ^ st[i + 5] ^ st[i + 10] ^ st[i + 15] ^ st[i + 20];
+        }
+        
+        for (int i = 0; i < 5; i++) {
+            ulong t = bc[(i + 4) % 5] ^ rotl64(bc[(i + 1) % 5], 1);
+            for (int j = 0; j < 25; j += 5) {
+                st[j + i] ^= t;
+            }
+        }
+        
+        // Rho and Pi
+        ulong t = st[1];
+        for (int i = 0; i < 24; i++) {
+            int j = KECCAK_PILN[i];
+            ulong temp = st[j];
+            st[j] = rotl64(t, KECCAK_ROTC[i]);
+            t = temp;
+        }
+        
+        // Chi
+        for (int j = 0; j < 25; j += 5) {
+            ulong temp[5];
+            for (int i = 0; i < 5; i++) {
+                temp[i] = st[j + i];
+            }
+            for (int i = 0; i < 5; i++) {
+                st[j + i] ^= (~temp[(i + 1) % 5]) & temp[(i + 2) % 5];
+            }
+        }
+        
+        // Iota
+        st[0] ^= KECCAK_RC[round];
+    }
+}
+
+// Keccak-256 for 64-byte input (uncompressed pubkey without 0x04 prefix)
+// Returns 32-byte hash, but we only need last 20 bytes for Ethereum address
+void keccak256_64(thread const uchar* data, thread uchar* hash) {
+    // State: 25 x 64-bit words = 200 bytes
+    ulong st[25];
+    for (int i = 0; i < 25; i++) st[i] = 0;
+    
+    // Absorb: rate = 1088 bits = 136 bytes, so 64 bytes fits in one block
+    // Load 64 bytes of data (8 words) in little-endian
+    for (int i = 0; i < 8; i++) {
+        st[i] = ((ulong)data[i*8]) | ((ulong)data[i*8+1] << 8) |
+                ((ulong)data[i*8+2] << 16) | ((ulong)data[i*8+3] << 24) |
+                ((ulong)data[i*8+4] << 32) | ((ulong)data[i*8+5] << 40) |
+                ((ulong)data[i*8+6] << 48) | ((ulong)data[i*8+7] << 56);
+    }
+    
+    // Padding: 0x01 after data, 0x80 at end of rate block
+    // For 64-byte input with 136-byte rate:
+    // Byte 64 = 0x01, Byte 135 = 0x80
+    st[8] ^= 0x01ULL;           // Byte 64: padding start (in word 8)
+    st[16] ^= 0x8000000000000000ULL;  // Byte 135: padding end (MSB of word 16, since 135 = 16*8 + 7)
+    
+    // Apply Keccak-f[1600]
+    keccakf(st);
+    
+    // Squeeze: extract 32 bytes (256 bits) in little-endian
+    for (int i = 0; i < 4; i++) {
+        hash[i*8+0] = st[i] & 0xFF;
+        hash[i*8+1] = (st[i] >> 8) & 0xFF;
+        hash[i*8+2] = (st[i] >> 16) & 0xFF;
+        hash[i*8+3] = (st[i] >> 24) & 0xFF;
+        hash[i*8+4] = (st[i] >> 32) & 0xFF;
+        hash[i*8+5] = (st[i] >> 40) & 0xFF;
+        hash[i*8+6] = (st[i] >> 48) & 0xFF;
+        hash[i*8+7] = (st[i] >> 56) & 0xFF;
+    }
+}
+
+// Compute Ethereum address from uncompressed pubkey (64 bytes, no 0x04 prefix)
+// Returns 20-byte address = Keccak256(pubkey)[12:32]
+void eth_address_from_pubkey(thread const uchar* pubkey_xy, thread uchar* addr) {
+    uchar hash[32];
+    keccak256_64(pubkey_xy, hash);
+    
+    // Ethereum address = last 20 bytes of Keccak256 hash
+    for (int i = 0; i < 20; i++) {
+        addr[i] = hash[12 + i];
+    }
+}
+
+// ============================================================================
 // MODULAR ARITHMETIC (256-bit over secp256k1 prime)
 // ============================================================================
 
@@ -694,14 +840,15 @@ kernel void process_brainwallet_batch(
     uint count = *passphrase_count;
     if (gid >= count) return;
     
-    // Read passphrase
-    uint pp_stride = 1 + MAX_PASSPHRASE_LEN;  // len byte + data
-    uint pp_offset = gid * pp_stride;
-    uint pp_len = passphrases[pp_offset];
+    // Read passphrase from 16-byte aligned buffer
+    // Format: [length:1][padding:15][data:128] = 144 bytes per entry
+    uint pp_offset = gid * PASSPHRASE_STRIDE;
+    uint pp_len = passphrases[pp_offset];  // Length at byte 0
     
     uchar passphrase[MAX_PASSPHRASE_LEN];
+    // Data starts at byte 16 (after 16-byte aligned header)
     for (uint i = 0; i < pp_len && i < MAX_PASSPHRASE_LEN; i++) {
-        passphrase[i] = passphrases[pp_offset + 1 + i];
+        passphrase[i] = passphrases[pp_offset + PASSPHRASE_HEADER_SIZE + i];
     }
     
     // Step 1: SHA256(passphrase) → private_key (32 bytes)
@@ -855,7 +1002,12 @@ kernel void process_brainwallet_batch(
         store_be(Qx, taproot);
     }
     
-    // Write output: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + pubkey_u(64) + priv_key(32) = 188 bytes
+    // Step 10: Ethereum address = Keccak256(pubkey_u without 0x04)[12:32]
+    // Computed entirely on GPU - no CPU post-processing needed!
+    uchar eth_addr[20];
+    eth_address_from_pubkey(pubkey_u + 1, eth_addr);  // Skip 0x04 prefix
+    
+    // Write output: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32) = 144 bytes
     for (int i = 0; i < 20; i++) {
         output[out_offset + i] = h160_c[i];
         output[out_offset + 20 + i] = h160_u[i];
@@ -864,13 +1016,13 @@ kernel void process_brainwallet_batch(
     for (int i = 0; i < 32; i++) {
         output[out_offset + 60 + i] = taproot[i];
     }
-    // pubkey_u without 0x04 prefix (64 bytes = X || Y)
-    for (int i = 0; i < 64; i++) {
-        output[out_offset + 92 + i] = pubkey_u[1 + i];
+    // eth_addr (20 bytes) - computed on GPU via Keccak256
+    for (int i = 0; i < 20; i++) {
+        output[out_offset + 92 + i] = eth_addr[i];
     }
     // priv_key (32 bytes) - avoids SHA256 recomputation on CPU
     for (int i = 0; i < 32; i++) {
-        output[out_offset + 156 + i] = priv_key[i];
+        output[out_offset + 112 + i] = priv_key[i];
     }
 }
 

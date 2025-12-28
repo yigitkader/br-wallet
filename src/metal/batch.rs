@@ -20,9 +20,9 @@ pub struct BrainwalletResult {
     pub h160_nested: [u8; 20],
     /// Taproot x-only pubkey (32 bytes)
     pub taproot: [u8; 32],
-    /// Uncompressed public key (64 bytes, X||Y without 0x04 prefix)
-    /// Used for Ethereum Keccak256 address derivation on CPU
-    pub pubkey_u: [u8; 64],
+    /// Ethereum address (20 bytes) - Keccak256(pubkey)[12:32]
+    /// Computed entirely on GPU - no CPU post-processing needed!
+    pub eth_addr: [u8; 20],
     /// Private key (32 bytes) - SHA256(passphrase), avoids recomputation
     pub priv_key: [u8; 32],
 }
@@ -68,7 +68,7 @@ impl BatchProcessor {
                 h160_u: gpu_result.h160_u,
                 h160_nested: gpu_result.h160_nested,
                 taproot: gpu_result.taproot,
-                pubkey_u: gpu_result.pubkey_u,
+                eth_addr: gpu_result.eth_addr,
                 priv_key: gpu_result.priv_key,
             });
         }
@@ -101,13 +101,13 @@ impl BatchProcessor {
             
             let data = &raw_output[offset..offset + OUTPUT_SIZE];
             
-            // Parse inline
+            // Parse inline - layout: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32) = 144
             let h160_c: [u8; 20] = data[0..20].try_into().unwrap();
             let h160_u: [u8; 20] = data[20..40].try_into().unwrap();
             let h160_nested: [u8; 20] = data[40..60].try_into().unwrap();
             let taproot: [u8; 32] = data[60..92].try_into().unwrap();
-            let pubkey_u: [u8; 64] = data[92..156].try_into().unwrap();
-            let priv_key: [u8; 32] = data[156..188].try_into().unwrap();
+            let eth_addr: [u8; 20] = data[92..112].try_into().unwrap();
+            let priv_key: [u8; 32] = data[112..144].try_into().unwrap();
             
             // Skip invalid results
             if h160_c.iter().all(|&b| b == 0) {
@@ -122,7 +122,7 @@ impl BatchProcessor {
                     h160_u,
                     h160_nested,
                     taproot,
-                    pubkey_u,
+                    eth_addr,
                     priv_key,
                 });
             }
@@ -188,25 +188,17 @@ impl<'a> PassphraseBatcher<'a> {
                 end += 1;
             }
             
-            // Get line and clean it
+            // Get line and clean it - ONLY strip line endings, preserve whitespace!
             let mut line = &self.data[start..end];
             
-            // Strip line endings (CRLF, CR)
+            // Strip ONLY line endings (CRLF, CR) - preserve all other whitespace!
+            // ⚠️ Brainwallet passphrases can have leading/trailing spaces!
             if line.ends_with(b"\r") {
                 line = &line[..line.len() - 1];
             }
             
-            // Trim leading whitespace
-            while !line.is_empty() && (line[0] == b' ' || line[0] == b'\t') {
-                line = &line[1..];
-            }
-            
-            // Trim trailing whitespace
-            while !line.is_empty() && (line[line.len() - 1] == b' ' || line[line.len() - 1] == b'\t') {
-                line = &line[..line.len() - 1];
-            }
-            
-            // Skip empty lines
+            // ⚠️ NO WHITESPACE TRIMMING - spaces/tabs are part of the passphrase!
+            // Skip truly empty lines (only after CR stripping)
             if !line.is_empty() {
                 batch.push(line);
             }
@@ -263,6 +255,19 @@ mod tests {
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0], b"password");
         assert_eq!(batch[1], b"test123");
+    }
+    
+    #[test]
+    fn test_batcher_preserves_whitespace() {
+        // ⚠️ CRITICAL: Whitespace must be preserved for brainwallet accuracy!
+        let data = b" password \n\ttest\t\n  hello world  \n";
+        let mut batcher = PassphraseBatcher::new(data, 10);
+        
+        let batch = batcher.next_batch().unwrap();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0], b" password ");  // Leading/trailing spaces preserved
+        assert_eq!(batch[1], b"\ttest\t");    // Tabs preserved
+        assert_eq!(batch[2], b"  hello world  ");  // Multiple spaces preserved
     }
     
     #[test]

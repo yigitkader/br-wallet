@@ -15,29 +15,38 @@ use metal::{
 /// Metal shader source - embedded at compile time
 const SHADER_SOURCE: &str = include_str!("brainwallet.metal");
 
-/// Output size per passphrase: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) = 92 bytes
-pub const OUTPUT_SIZE: usize = 188; // h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + pubkey_u(64) + priv_key(32)
+/// Output size per passphrase: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32) = 144 bytes
+/// Note: Ethereum address is now computed on GPU via Keccak256 (no CPU post-processing needed!)
+pub const OUTPUT_SIZE: usize = 144;
 
 /// Maximum passphrase length
 pub const MAX_PASSPHRASE_LEN: usize = 128;
 
-/// Stride per passphrase in input buffer: 1 (length) + MAX_PASSPHRASE_LEN
-pub const PASSPHRASE_STRIDE: usize = 1 + MAX_PASSPHRASE_LEN;
+/// Stride per passphrase in input buffer: 16 (aligned header) + MAX_PASSPHRASE_LEN = 144
+/// 
+/// Memory alignment optimization:
+/// - Old stride: 129 bytes (unaligned - causes GPU memory access slowdown)
+/// - New stride: 144 bytes (16-byte aligned for optimal GPU coalescing)
+/// - Header: [length:1][padding:15][data:128] = 144 bytes
+/// 
+/// GPU memory coalescing works best with 16/32/64 byte aligned accesses.
+pub const PASSPHRASE_STRIDE: usize = 16 + MAX_PASSPHRASE_LEN;
 
 /// Result from GPU processing for a single passphrase
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct GpuBrainwalletResult {
-    pub h160_c: [u8; 20],       // HASH160(compressed pubkey)
-    pub h160_u: [u8; 20],       // HASH160(uncompressed pubkey)
-    pub h160_nested: [u8; 20],  // HASH160(P2SH-P2WPKH script)
-    pub taproot: [u8; 32],      // Taproot x-only pubkey
-    pub pubkey_u: [u8; 64],     // Uncompressed pubkey (X||Y without 0x04 prefix)
+    pub h160_c: [u8; 20],       // HASH160(compressed pubkey) - Bitcoin/Litecoin
+    pub h160_u: [u8; 20],       // HASH160(uncompressed pubkey) - Legacy addresses
+    pub h160_nested: [u8; 20],  // HASH160(P2SH-P2WPKH script) - Nested SegWit
+    pub taproot: [u8; 32],      // Taproot x-only pubkey - Bitcoin/Litecoin Taproot
+    pub eth_addr: [u8; 20],     // Keccak256(pubkey)[12:32] - Ethereum address (GPU-computed!)
     pub priv_key: [u8; 32],     // SHA256(passphrase) - private key
 }
 
 impl GpuBrainwalletResult {
     /// Parse from raw output bytes
+    /// Layout: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32) = 144
     #[inline]
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < OUTPUT_SIZE {
@@ -49,7 +58,7 @@ impl GpuBrainwalletResult {
             h160_u: [0u8; 20],
             h160_nested: [0u8; 20],
             taproot: [0u8; 32],
-            pubkey_u: [0u8; 64],
+            eth_addr: [0u8; 20],
             priv_key: [0u8; 32],
         };
         
@@ -57,8 +66,8 @@ impl GpuBrainwalletResult {
         result.h160_u.copy_from_slice(&data[20..40]);
         result.h160_nested.copy_from_slice(&data[40..60]);
         result.taproot.copy_from_slice(&data[60..92]);
-        result.pubkey_u.copy_from_slice(&data[92..156]);
-        result.priv_key.copy_from_slice(&data[156..188]);
+        result.eth_addr.copy_from_slice(&data[92..112]);
+        result.priv_key.copy_from_slice(&data[112..144]);
         
         Some(result)
     }
@@ -207,7 +216,8 @@ impl GpuBrainwallet {
         
         let count = passphrases.len().min(self.tier.threads_per_dispatch);
         
-        // Copy passphrases to input buffer
+        // Copy passphrases to input buffer with 16-byte aligned header
+        // Format: [length:1][padding:15][data:128] = 144 bytes per passphrase
         unsafe {
             let input_ptr = self.input_buffer.contents() as *mut u8;
             
@@ -215,20 +225,23 @@ impl GpuBrainwallet {
                 let offset = i * PASSPHRASE_STRIDE;
                 let len = passphrase.len().min(MAX_PASSPHRASE_LEN);
                 
-                // Write length byte
+                // Write length byte at offset 0
                 *input_ptr.add(offset) = len as u8;
                 
-                // Write passphrase data
+                // Zero the 15-byte padding (bytes 1-15)
+                std::ptr::write_bytes(input_ptr.add(offset + 1), 0, 15);
+                
+                // Write passphrase data starting at byte 16 (16-byte aligned)
                 std::ptr::copy_nonoverlapping(
                     passphrase.as_ptr(),
-                    input_ptr.add(offset + 1),
+                    input_ptr.add(offset + 16),
                     len,
                 );
                 
-                // Zero-pad remaining
+                // Zero-pad remaining passphrase area
                 if len < MAX_PASSPHRASE_LEN {
                     std::ptr::write_bytes(
-                        input_ptr.add(offset + 1 + len),
+                        input_ptr.add(offset + 16 + len),
                         0,
                         MAX_PASSPHRASE_LEN - len,
                     );
@@ -283,7 +296,7 @@ impl GpuBrainwallet {
                         h160_u: [0u8; 20],
                         h160_nested: [0u8; 20],
                         taproot: [0u8; 32],
-                        pubkey_u: [0u8; 64],
+                        eth_addr: [0u8; 20],
                         priv_key: [0u8; 32],
                     });
                 }
@@ -305,7 +318,7 @@ impl GpuBrainwallet {
         
         let count = passphrases.len().min(self.tier.threads_per_dispatch);
         
-        // Copy passphrases to input buffer
+        // Copy passphrases to input buffer with 16-byte aligned header
         unsafe {
             let input_ptr = self.input_buffer.contents() as *mut u8;
             
@@ -313,16 +326,18 @@ impl GpuBrainwallet {
                 let offset = i * PASSPHRASE_STRIDE;
                 let len = passphrase.len().min(MAX_PASSPHRASE_LEN);
                 
+                // Length byte + 15 bytes padding + data
                 *input_ptr.add(offset) = len as u8;
+                std::ptr::write_bytes(input_ptr.add(offset + 1), 0, 15);
                 std::ptr::copy_nonoverlapping(
                     passphrase.as_ptr(),
-                    input_ptr.add(offset + 1),
+                    input_ptr.add(offset + 16),
                     len,
                 );
                 
                 if len < MAX_PASSPHRASE_LEN {
                     std::ptr::write_bytes(
-                        input_ptr.add(offset + 1 + len),
+                        input_ptr.add(offset + 16 + len),
                         0,
                         MAX_PASSPHRASE_LEN - len,
                     );

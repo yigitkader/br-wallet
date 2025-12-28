@@ -56,34 +56,27 @@ fn estimate_line_count(mmap: &Mmap) -> u64 {
     (mmap.len() as u64 * total_lines) / total_bytes as u64
 }
 
-/// Satır temizleme: CRLF/LF ve leading/trailing whitespace
+/// Satır temizleme: SADECE CRLF/LF/CR satır sonlarını temizle
 /// 
-/// Wordlist dosyalarında genellikle:
-/// - Windows CRLF (\r\n) veya Unix LF (\n) satır sonları
-/// - Yanlışlıkla eklenen boşluk/tab karakterleri olabilir
+/// ⚠️ CRITICAL: Boşluklar (space/tab) KORUNUR!
+/// Brainwallet passphrase'leri " password " gibi başında/sonunda 
+/// boşluk içerebilir. Bunları temizlemek false negative'e yol açar.
 /// 
-/// Brainwallet passphrases genellikle trim edilmiş formatta kullanılır.
+/// Wordlist dosyalarında:
+/// - Windows CRLF (\r\n) veya Unix LF (\n) satır sonları temizlenir
+/// - Leading/trailing boşluklar KORUNUR (passphrase'in parçası olabilir)
 #[inline(always)]
 fn clean_line(line: &[u8]) -> &[u8] {
     let mut l = line;
     
-    // Strip line endings (CRLF, LF, CR)
+    // Strip ONLY line endings (CRLF, LF, CR) - preserve all other whitespace!
     if l.ends_with(b"\r\n") {
         l = &l[..l.len() - 2];
     } else if l.ends_with(b"\n") || l.ends_with(b"\r") {
         l = &l[..l.len() - 1];
     }
     
-    // Trim leading whitespace (space, tab)
-    while !l.is_empty() && (l[0] == b' ' || l[0] == b'\t') {
-        l = &l[1..];
-    }
-    
-    // Trim trailing whitespace (space, tab)
-    while !l.is_empty() && (l[l.len() - 1] == b' ' || l[l.len() - 1] == b'\t') {
-        l = &l[..l.len() - 1];
-    }
-    
+    // ⚠️ NO WHITESPACE TRIMMING - spaces/tabs are part of the passphrase!
     l
 }
 
@@ -177,18 +170,10 @@ fn try_gpu_cracking(dict: &str, comparer: &Comparer) -> Result<(), String> {
                     }
                 }
                 
-                // Check Ethereum - use GPU pubkey_u with Keccak256 (NO secp256k1 re-computation!)
+                // Check Ethereum - use GPU-computed eth_addr directly (FULL GPU COMPUTATION!)
                 if comparer.eth_on {
-                    use tiny_keccak::{Hasher, Keccak};
-                    let mut keccak = Keccak::v256();
-                    keccak.update(&result.pubkey_u);
-                    let mut hash = [0u8; 32];
-                    keccak.finalize(&mut hash);
-                    
-                    let eth_addr: [u8; 20] = hash[12..32].try_into().unwrap();
-                    
-                    if comparer.eth_20.contains(&eth_addr) {
-                        let eth_addr_hex = format!("0x{}", hex::encode(&eth_addr));
+                    if comparer.eth_20.contains(&result.eth_addr) {
+                        let eth_addr_hex = format!("0x{}", hex::encode(&result.eth_addr));
                         rep.push_str(&format!(
                             "=== ETHEREUM MATCH ===\n\
                              Passphrase: {}\n\
@@ -353,7 +338,7 @@ fn start_cracking_cpu(dict: &str, comparer: &Comparer) {
     let counter = AtomicU64::new(0);
 
     mmap.par_split(|&b| b == b'\n').for_each(|raw_line| {
-        // Sadece Windows \r karakterini temizle (boşluklar passphrase parçası!)
+        // Sadece satır sonlarını temizle - boşluklar passphrase parçası!
         let line = clean_line(raw_line);
         
         if line.is_empty() {
