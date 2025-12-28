@@ -15,6 +15,7 @@ use crate::comparer::Comparer;
 use crate::metal::{BatchProcessor, BrainwalletResult, PassphraseBatcher};
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
+use rayon::prelude::*;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::sync::{
@@ -151,71 +152,59 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
             }
         };
 
-        // Zero-allocation matching: iterate raw bytes + passphrases together
-        // Only allocate when we find a match
-        let mut all_matches: Vec<String> = Vec::new();
-        
-        for (i, passphrase) in batch.iter().enumerate() {
-            let raw = match raw_output.get(i) {
-                Some(r) => r,
-                None => continue,
-            };
-            
-            // Skip invalid results (zero hashes)
-            if !raw.is_valid() {
-                continue;
-            }
-            
-            let mut matched = false;
-            let mut rep = String::new();
-            
-            // Check Bitcoin (zero-copy hash access)
-            if comparer.btc_on {
-                if comparer.btc_20.contains(raw.h160_c())
-                    || comparer.btc_20.contains(raw.h160_u())
-                    || comparer.btc_20.contains(raw.h160_nested())
-                    || comparer.btc_32.contains(raw.taproot())
-                {
-                    matched = true;
-                    // Only now allocate BrainwalletResult
-                    let result = raw.to_owned(passphrase);
-                    let pass = String::from_utf8_lossy(passphrase);
-                    rep.push_str(&format_btc_match(&result, &pass));
+        // PARALLEL matching using rayon - all CPU cores utilized
+        // Zero-allocation: only allocate BrainwalletResult on match
+        let all_matches: Vec<String> = batch
+            .par_iter()
+            .enumerate()
+            .filter_map(|(i, passphrase)| {
+                let raw = raw_output.get(i)?;
+                
+                // Skip invalid results (zero hashes)
+                if !raw.is_valid() {
+                    return None;
                 }
-            }
-
-            // Check Litecoin (zero-copy hash access)
-            if comparer.ltc_on {
-                if comparer.ltc_20.contains(raw.h160_c())
-                    || comparer.ltc_20.contains(raw.h160_u())
-                    || comparer.ltc_20.contains(raw.h160_nested())
-                    || comparer.ltc_32.contains(raw.taproot())
-                {
-                    if !matched {
-                        matched = true;
+                
+                let mut rep = String::new();
+                
+                // Check Bitcoin (zero-copy hash access)
+                if comparer.btc_on {
+                    if comparer.btc_20.contains(raw.h160_c())
+                        || comparer.btc_20.contains(raw.h160_u())
+                        || comparer.btc_20.contains(raw.h160_nested())
+                        || comparer.btc_32.contains(raw.taproot())
+                    {
+                        let result = raw.to_owned(passphrase);
+                        let pass = String::from_utf8_lossy(passphrase);
+                        rep.push_str(&format_btc_match(&result, &pass));
                     }
-                    let result = raw.to_owned(passphrase);
-                    let pass = String::from_utf8_lossy(passphrase);
-                    rep.push_str(&format_ltc_match(&result, &pass));
                 }
-            }
 
-            // Check Ethereum (zero-copy hash access)
-            if comparer.eth_on {
-                if comparer.eth_20.contains(raw.eth_addr()) {
-                    if !matched {
-                        // matched = true; // not needed, last check
+                // Check Litecoin (zero-copy hash access)
+                if comparer.ltc_on {
+                    if comparer.ltc_20.contains(raw.h160_c())
+                        || comparer.ltc_20.contains(raw.h160_u())
+                        || comparer.ltc_20.contains(raw.h160_nested())
+                        || comparer.ltc_32.contains(raw.taproot())
+                    {
+                        let result = raw.to_owned(passphrase);
+                        let pass = String::from_utf8_lossy(passphrase);
+                        rep.push_str(&format_ltc_match(&result, &pass));
                     }
-                    let result = raw.to_owned(passphrase);
-                    let pass = String::from_utf8_lossy(passphrase);
-                    rep.push_str(&format_eth_match(&result, &pass));
                 }
-            }
-            
-            if !rep.is_empty() {
-                all_matches.push(rep);
-            }
-        }
+
+                // Check Ethereum (zero-copy hash access)
+                if comparer.eth_on {
+                    if comparer.eth_20.contains(raw.eth_addr()) {
+                        let result = raw.to_owned(passphrase);
+                        let pass = String::from_utf8_lossy(passphrase);
+                        rep.push_str(&format_eth_match(&result, &pass));
+                    }
+                }
+                
+                if rep.is_empty() { None } else { Some(rep) }
+            })
+            .collect();
 
         // Write all matches
         if !all_matches.is_empty() {

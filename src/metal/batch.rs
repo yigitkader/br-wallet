@@ -125,18 +125,18 @@ impl<'a> RawGpuResult<'a> {
     }
 }
 
-/// Raw GPU output buffer - zero-copy access to batch results
+/// Raw GPU output buffer - TRUE zero-copy access to batch results
 /// 
-/// This struct holds the raw bytes from GPU and provides zero-copy
-/// iteration over results. NO heap allocations until a match is found.
-pub struct RawBatchOutput {
-    /// Raw output bytes from GPU
-    data: Vec<u8>,
+/// This struct holds a REFERENCE to the GPU buffer (no heap allocation).
+/// Data is valid until the next GPU dispatch.
+pub struct RawBatchOutput<'a> {
+    /// Direct reference to GPU output buffer (no copy!)
+    data: &'a [u8],
     /// Number of valid results
     count: usize,
 }
 
-impl RawBatchOutput {
+impl<'a> RawBatchOutput<'a> {
     /// Get number of results
     #[inline]
     #[allow(dead_code)]
@@ -153,7 +153,7 @@ impl RawBatchOutput {
     
     /// Get raw result at index (zero-copy)
     #[inline]
-    pub fn get(&self, index: usize) -> Option<RawGpuResult<'_>> {
+    pub fn get(&self, index: usize) -> Option<RawGpuResult<'a>> {
         if index >= self.count {
             return None;
         }
@@ -167,7 +167,7 @@ impl RawBatchOutput {
     /// Iterate over all results (zero-copy)
     #[inline]
     #[allow(dead_code)]
-    pub fn iter(&self) -> impl Iterator<Item = RawGpuResult<'_>> {
+    pub fn iter(&self) -> impl Iterator<Item = RawGpuResult<'a>> + '_ {
         (0..self.count).filter_map(move |i| self.get(i))
     }
 }
@@ -191,28 +191,20 @@ impl BatchProcessor {
         self.gpu.max_batch_size()
     }
     
-    /// Process a batch and return raw output (zero-copy friendly)
+    /// Process a batch and return raw output (TRUE zero-copy)
     /// 
-    /// ⚠️ PERFORMANCE: This is the recommended method for maximum performance.
+    /// ⚠️ PERFORMANCE: This is the fastest method.
+    /// Returns a direct reference to GPU buffer - NO heap allocation!
+    /// Data is valid until the next call to process_raw.
+    /// 
     /// Iterate over RawBatchOutput without allocating BrainwalletResult for each passphrase.
     /// Only call RawGpuResult::to_owned() when a match is confirmed.
-    pub fn process_raw(&self, passphrases: &[&[u8]]) -> Result<RawBatchOutput, String> {
-        let gpu_results = self.gpu.process_batch(passphrases)?;
+    pub fn process_raw<'a>(&'a self, passphrases: &[&[u8]]) -> Result<RawBatchOutput<'a>, String> {
+        // Use process_batch_raw for TRUE zero-copy (returns slice into GPU buffer)
+        let raw_data = self.gpu.process_batch_raw(passphrases)?;
+        let count = passphrases.len().min(self.gpu.max_batch_size());
         
-        // Convert to raw bytes
-        let count = gpu_results.len();
-        let mut data = Vec::with_capacity(count * OUTPUT_SIZE);
-        
-        for result in &gpu_results {
-            data.extend_from_slice(&result.h160_c);
-            data.extend_from_slice(&result.h160_u);
-            data.extend_from_slice(&result.h160_nested);
-            data.extend_from_slice(&result.taproot);
-            data.extend_from_slice(&result.eth_addr);
-            data.extend_from_slice(&result.priv_key);
-        }
-        
-        Ok(RawBatchOutput { data, count })
+        Ok(RawBatchOutput { data: raw_data, count })
     }
     
     /// Process a batch of passphrases (legacy API - allocates for each result)

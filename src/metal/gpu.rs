@@ -218,12 +218,8 @@ impl GpuBrainwallet {
         
         let count = passphrases.len().min(self.tier.threads_per_dispatch);
         
-        // Zero output buffer to prevent stale data (defensive programming)
-        // Only zero the region we'll actually use
-        unsafe {
-            let output_ptr = self.output_buffer.contents() as *mut u8;
-            std::ptr::write_bytes(output_ptr, 0, count * OUTPUT_SIZE);
-        }
+        // NOTE: Output buffer zeroing removed - shader writes to entire area
+        // Stale data would only affect results beyond 'count' which are never read
         
         // Copy passphrases to input buffer with 16-byte aligned header
         // Format: [length:1][padding:15][data:128] = 144 bytes per passphrase
@@ -321,10 +317,11 @@ impl GpuBrainwallet {
         Ok(results)
     }
     
-    /// Process a batch and return raw bytes
+    /// Process a batch and return raw bytes (TRUE zero-copy)
     /// 
-    /// This is more efficient when you only need to check specific hashes.
-    #[allow(dead_code)]
+    /// Returns a direct slice into the GPU output buffer.
+    /// This is the most efficient method - no heap allocation.
+    /// Data is valid until the next call to any process method.
     pub fn process_batch_raw(&self, passphrases: &[&[u8]]) -> Result<&[u8], String> {
         if passphrases.is_empty() {
             return Ok(&[]);
