@@ -67,8 +67,13 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
             return;
         }
 
-        let w =
-            MultiWallet::generate_active(line, comparer.btc_on, comparer.eth_on, comparer.sol_on);
+        let w = MultiWallet::generate_active(
+            line,
+            comparer.btc_on,
+            comparer.ltc_on,
+            comparer.eth_on,
+            comparer.sol_on,
+        );
         let pass = String::from_utf8_lossy(line);
         let mut rep = String::new();
 
@@ -79,6 +84,15 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
                 || comparer.btc_32.contains(&btc.taproot)
             {
                 rep.push_str(&btc.get_report(&pass));
+            }
+        }
+        if let Some(ltc) = w.ltc {
+            if comparer.ltc_20.contains(&ltc.h160_c)
+                || comparer.ltc_20.contains(&ltc.h160_u)  // Legacy uncompressed
+                || comparer.ltc_20.contains(&ltc.h160_nested)
+                || comparer.ltc_32.contains(&ltc.taproot)
+            {
+                rep.push_str(&ltc.get_report(&pass));
             }
         }
         if let Some(eth) = w.eth {

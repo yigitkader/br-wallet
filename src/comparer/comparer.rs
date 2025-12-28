@@ -18,9 +18,12 @@ const CACHE_HEADER_SIZE: usize = 16;
 pub struct Comparer {
     pub btc_20: FxHashSet<[u8; 20]>,
     pub btc_32: FxHashSet<[u8; 32]>,
+    pub ltc_20: FxHashSet<[u8; 20]>,
+    pub ltc_32: FxHashSet<[u8; 32]>,
     pub eth_20: FxHashSet<[u8; 20]>,
     pub sol_32: FxHashSet<[u8; 32]>,
     pub btc_on: bool,
+    pub ltc_on: bool,
     pub eth_on: bool,
     pub sol_on: bool,
 }
@@ -28,10 +31,12 @@ pub struct Comparer {
 impl Comparer {
     pub fn load() -> Self {
         let (btc_20, btc_32) = Self::load_net("bitcoin");
+        let (ltc_20, ltc_32) = Self::load_net("litecoin");
         let (eth_20, _) = Self::load_net("ethereum");
         let (_, sol_32) = Self::load_net("solana");
 
         let btc_count = btc_20.len() + btc_32.len();
+        let ltc_count = ltc_20.len() + ltc_32.len();
         let eth_count = eth_20.len();
         let sol_count = sol_32.len();
         
@@ -39,6 +44,10 @@ impl Comparer {
         if btc_count > 0 {
             println!("📦 Bitcoin: {} adres (Legacy/SegWit: {}, Taproot: {})", 
                      btc_count, btc_20.len(), btc_32.len());
+        }
+        if ltc_count > 0 {
+            println!("📦 Litecoin: {} adres (Legacy/SegWit: {}, Taproot: {})", 
+                     ltc_count, ltc_20.len(), ltc_32.len());
         }
         if eth_count > 0 {
             println!("📦 Ethereum: {} adres", eth_count);
@@ -49,10 +58,13 @@ impl Comparer {
 
         Comparer {
             btc_on: btc_count > 0,
+            ltc_on: ltc_count > 0,
             eth_on: eth_count > 0,
             sol_on: sol_count > 0,
             btc_20,
             btc_32,
+            ltc_20,
+            ltc_32,
             eth_20,
             sol_32,
         }
@@ -211,6 +223,24 @@ impl Comparer {
             match name {
                 "bitcoin" => {
                     if a.starts_with("bc1") {
+                        if let Ok((_, _, p)) = bech32::segwit::decode(a) {
+                            if let Ok(arr) = <[u8; 20]>::try_from(p.as_slice()) {
+                                h20.insert(arr);
+                            } else if let Ok(arr) = <[u8; 32]>::try_from(p.as_slice()) {
+                                h32.insert(arr);
+                            }
+                        }
+                    } else if let Ok(d) = bs58::decode(a).with_check(None).into_vec() {
+                        if d.len() >= 21 {
+                            if let Ok(arr) = <[u8; 20]>::try_from(&d[1..21]) {
+                                h20.insert(arr);
+                            }
+                        }
+                    }
+                }
+                "litecoin" => {
+                    // Litecoin: ltc1q... (SegWit), ltc1p... (Taproot), L.../M... (Legacy/P2SH)
+                    if a.starts_with("ltc1") {
                         if let Ok((_, _, p)) = bech32::segwit::decode(a) {
                             if let Ok(arr) = <[u8; 20]>::try_from(p.as_slice()) {
                                 h20.insert(arr);

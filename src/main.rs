@@ -3,8 +3,8 @@ mod comparer;
 mod reader;
 
 fn main() {
-    println!("--- Universal Blockchain Brainwallet Cracker v2.1 ---");
-    println!("Ağlar: Bitcoin (Legacy, SegWit, Taproot), Ethereum, Solana\n");
+    println!("--- Universal Blockchain Brainwallet Cracker v2.2 ---");
+    println!("Ağlar: Bitcoin, Litecoin, Ethereum, Solana\n");
 
     // Dictionary dosyası
     let dict_path = std::env::args().nth(1).unwrap_or_else(|| "weakpass_4.merged.txt".to_string());
@@ -19,10 +19,11 @@ fn main() {
     println!("🔍 Hedef adresler yükleniyor...");
     let comparer = comparer::Comparer::load();
     
-    if !comparer.btc_on && !comparer.eth_on && !comparer.sol_on {
+    if !comparer.btc_on && !comparer.ltc_on && !comparer.eth_on && !comparer.sol_on {
         eprintln!("\n⚠️  Uyarı: Hiçbir hedef adres yüklenmedi!");
         eprintln!("   Aşağıdaki dosyaları oluşturun:");
         eprintln!("   - bitcoin_targets.json");
+        eprintln!("   - litecoin_targets.json");
         eprintln!("   - ethereum_targets.json");
         eprintln!("   - solana_targets.json");
         eprintln!("\n   Format: {{\"addresses\": [\"addr1\", \"addr2\", ...]}}");
@@ -30,8 +31,9 @@ fn main() {
     }
     
     println!(
-        "\n✅ Aktif ağlar: {}{}{}",
+        "\n✅ Aktif ağlar: {}{}{}{}",
         if comparer.btc_on { "BTC " } else { "" },
+        if comparer.ltc_on { "LTC " } else { "" },
         if comparer.eth_on { "ETH " } else { "" },
         if comparer.sol_on { "SOL " } else { "" }
     );
