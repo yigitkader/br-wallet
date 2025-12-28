@@ -23,9 +23,14 @@ const GPU_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// Metal shader source - embedded at compile time
 const SHADER_SOURCE: &str = include_str!("brainwallet.metal");
 
-/// Output size per passphrase: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32) = 144 bytes
-/// Note: Ethereum address is now computed on GPU via Keccak256 (no CPU post-processing needed!)
-pub const OUTPUT_SIZE: usize = 144;
+/// Output size per passphrase: 184 bytes total
+/// Primary (144 bytes): h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32)
+/// GLV (40 bytes): glv_h160_c(20) + glv_eth_addr(20) - FREE 2x throughput via endomorphism!
+/// 
+/// GLV Endomorphism gives us TWO keypairs from ONE EC computation:
+///   Primary: (k, P) where P = k*G
+///   GLV:     (λ*k mod n, φ(P)) where φ(P) = (β*x, y)
+pub const OUTPUT_SIZE: usize = 184;
 
 /// Maximum passphrase length
 pub const MAX_PASSPHRASE_LEN: usize = 128;
@@ -41,20 +46,31 @@ pub const MAX_PASSPHRASE_LEN: usize = 128;
 pub const PASSPHRASE_STRIDE: usize = 16 + MAX_PASSPHRASE_LEN;
 
 /// Result from GPU processing for a single passphrase
+/// 
+/// GLV Endomorphism bonus: From ONE EC computation, we get TWO valid keypairs!
+///   Primary: (k, P) where P = k*G
+///   GLV:     (λ*k mod n, φ(P)) where φ(P) = (β*x, y) - essentially FREE!
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct GpuBrainwalletResult {
+    // Primary keypair (144 bytes)
     pub h160_c: [u8; 20],       // HASH160(compressed pubkey) - Bitcoin/Litecoin
     pub h160_u: [u8; 20],       // HASH160(uncompressed pubkey) - Legacy addresses
     pub h160_nested: [u8; 20],  // HASH160(P2SH-P2WPKH script) - Nested SegWit
     pub taproot: [u8; 32],      // Taproot x-only pubkey - Bitcoin/Litecoin Taproot
-    pub eth_addr: [u8; 20],     // Keccak256(pubkey)[12:32] - Ethereum address (GPU-computed!)
+    pub eth_addr: [u8; 20],     // Keccak256(pubkey)[12:32] - Ethereum address
     pub priv_key: [u8; 32],     // SHA256(passphrase) - private key
+    
+    // GLV endomorphism bonus (40 bytes) - FREE 2x throughput!
+    pub glv_h160_c: [u8; 20],   // HASH160(GLV compressed pubkey) - Bitcoin/Litecoin
+    pub glv_eth_addr: [u8; 20], // Keccak256(GLV pubkey)[12:32] - Ethereum address
 }
 
 impl GpuBrainwalletResult {
     /// Parse from raw output bytes
-    /// Layout: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32) = 144
+    /// Layout: Primary(144) + GLV(40) = 184 bytes
+    ///   Primary: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32)
+    ///   GLV: glv_h160_c(20) + glv_eth_addr(20)
     #[inline]
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < OUTPUT_SIZE {
@@ -68,14 +84,21 @@ impl GpuBrainwalletResult {
             taproot: [0u8; 32],
             eth_addr: [0u8; 20],
             priv_key: [0u8; 32],
+            glv_h160_c: [0u8; 20],
+            glv_eth_addr: [0u8; 20],
         };
         
+        // Primary keypair
         result.h160_c.copy_from_slice(&data[0..20]);
         result.h160_u.copy_from_slice(&data[20..40]);
         result.h160_nested.copy_from_slice(&data[40..60]);
         result.taproot.copy_from_slice(&data[60..92]);
         result.eth_addr.copy_from_slice(&data[92..112]);
         result.priv_key.copy_from_slice(&data[112..144]);
+        
+        // GLV bonus
+        result.glv_h160_c.copy_from_slice(&data[144..164]);
+        result.glv_eth_addr.copy_from_slice(&data[164..184]);
         
         Some(result)
     }
@@ -323,6 +346,8 @@ impl GpuBrainwallet {
                         taproot: [0u8; 32],
                         eth_addr: [0u8; 20],
                         priv_key: [0u8; 32],
+                        glv_h160_c: [0u8; 20],
+                        glv_eth_addr: [0u8; 20],
                     });
                 }
             }

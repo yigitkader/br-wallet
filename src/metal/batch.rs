@@ -6,10 +6,18 @@
 //! ## Performance Architecture
 //!
 //! The key optimization is **zero-allocation matching**:
-//! - GPU returns raw bytes (144 bytes per passphrase)
+//! - GPU returns raw bytes (184 bytes per passphrase, including GLV bonus)
 //! - We iterate over raw bytes without allocating BrainwalletResult for each
 //! - Only when a match is found do we allocate and copy data
 //! - This eliminates millions of heap allocations per second
+//!
+//! ## GLV Endomorphism (FREE 2x THROUGHPUT!)
+//!
+//! From ONE EC computation k*G, we get TWO valid keypairs:
+//! - Primary: (k, P) where P = k*G
+//! - GLV: (λ*k mod n, φ(P)) where φ(P) = (β*x, y)
+//!
+//! This essentially DOUBLES our address checking throughput for free!
 
 use std::sync::Arc;
 
@@ -33,10 +41,15 @@ pub struct BrainwalletResult {
     /// Taproot x-only pubkey (32 bytes)
     pub taproot: [u8; 32],
     /// Ethereum address (20 bytes) - Keccak256(pubkey)[12:32]
-    /// Computed entirely on GPU - no CPU post-processing needed!
     pub eth_addr: [u8; 20],
-    /// Private key (32 bytes) - SHA256(passphrase), avoids recomputation
+    /// Private key (32 bytes) - SHA256(passphrase)
     pub priv_key: [u8; 32],
+    
+    // GLV Endomorphism bonus (FREE 2x throughput!)
+    /// HASH160(GLV compressed pubkey) - Bitcoin/Litecoin
+    pub glv_h160_c: [u8; 20],
+    /// GLV Ethereum address - Keccak256(GLV pubkey)[12:32]
+    pub glv_eth_addr: [u8; 20],
 }
 
 impl BrainwalletResult {
@@ -50,7 +63,9 @@ impl BrainwalletResult {
 /// Zero-copy view into GPU output for a single passphrase
 /// 
 /// This is used for efficient matching without heap allocation.
-/// Layout: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32) = 144
+/// Layout: Primary(144) + GLV(40) = 184 bytes
+///   Primary: h160_c(20) + h160_u(20) + h160_nested(20) + taproot(32) + eth_addr(20) + priv_key(32)
+///   GLV: glv_h160_c(20) + glv_eth_addr(20)
 #[derive(Clone, Copy)]
 pub struct RawGpuResult<'a> {
     data: &'a [u8],
@@ -97,6 +112,22 @@ impl<'a> RawGpuResult<'a> {
         self.data[60..92].try_into().unwrap()
     }
     
+    // =========================================================================
+    // GLV Endomorphism accessors (FREE 2x throughput!)
+    // =========================================================================
+    
+    /// Get GLV h160_c (compressed GLV pubkey hash) - zero-copy
+    #[inline]
+    pub fn glv_h160_c(&self) -> &[u8; 20] {
+        self.data[144..164].try_into().unwrap()
+    }
+    
+    /// Get GLV Ethereum address - zero-copy
+    #[inline]
+    pub fn glv_eth_addr(&self) -> &[u8; 20] {
+        self.data[164..184].try_into().unwrap()
+    }
+    
     /// Get Ethereum address - zero-copy
     #[inline]
     pub fn eth_addr(&self) -> &[u8; 20] {
@@ -121,6 +152,8 @@ impl<'a> RawGpuResult<'a> {
             taproot: *self.taproot(),
             eth_addr: *self.eth_addr(),
             priv_key: *self.priv_key(),
+            glv_h160_c: *self.glv_h160_c(),
+            glv_eth_addr: *self.glv_eth_addr(),
         }
     }
 }
@@ -226,6 +259,8 @@ impl BatchProcessor {
                 taproot: gpu_result.taproot,
                 eth_addr: gpu_result.eth_addr,
                 priv_key: gpu_result.priv_key,
+                glv_h160_c: gpu_result.glv_h160_c,
+                glv_eth_addr: gpu_result.glv_eth_addr,
             });
         }
         
@@ -412,10 +447,12 @@ mod tests {
     #[test]
     fn test_raw_gpu_result_zero_copy() {
         // Test that RawGpuResult doesn't allocate
-        let data = [0u8; 144];
+        // Layout: Primary(144) + GLV(40) = 184 bytes
+        let data = [0u8; OUTPUT_SIZE];
         let raw = RawGpuResult::new(&data).unwrap();
         
         // These should all be zero-copy references
+        // Primary
         assert_eq!(raw.h160_c().len(), 20);
         assert_eq!(raw.h160_u().len(), 20);
         assert_eq!(raw.h160_nested().len(), 20);
@@ -423,7 +460,11 @@ mod tests {
         assert_eq!(raw.eth_addr().len(), 20);
         assert_eq!(raw.priv_key().len(), 32);
         
-        // Total should be 144
+        // GLV bonus (FREE 2x throughput!)
+        assert_eq!(raw.glv_h160_c().len(), 20);
+        assert_eq!(raw.glv_eth_addr().len(), 20);
+        
+        // Total should be 184
         assert!(!raw.is_valid()); // all zeros
     }
 }
