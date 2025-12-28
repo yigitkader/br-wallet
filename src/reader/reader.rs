@@ -268,14 +268,16 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
                 })
                 .collect();
 
-            // Write matches
+            // Write matches - IMMEDIATE FLUSH after each match to prevent data loss
+            // If program crashes, we don't want to lose found matches
             if !all_matches.is_empty() {
                 let mut f = log.lock().unwrap();
                 for rep in &all_matches {
                     let _ = f.write_all(rep.as_bytes());
+                    // Flush immediately after each match - critical for data safety
+                    let _ = f.flush();
                     pb.println(format!("\n{}", rep));
                 }
-                let _ = f.flush();
             }
 
             // Update progress

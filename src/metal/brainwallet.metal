@@ -123,10 +123,12 @@ constant uchar RIPEMD_SR[80] = {8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,9,13,15,
 #define OUTPUT_SIZE 152
 #define MAX_PASSPHRASE_LEN 128
 
-// Input stride: 16-byte aligned header (1 byte length + 15 padding) + 128 bytes data = 144 bytes
-// This alignment improves GPU memory coalescing performance
+// Input stride: 256 bytes (power of 2 for optimal GPU memory coalescing)
+// Layout: [16 bytes header (1 byte length + 15 padding)] [128 bytes passphrase] [112 bytes padding]
+// GPU memory controllers work with 32/64/128/256 byte aligned blocks
+// 144 bytes breaks coalescing; 256 bytes enables optimal memory access patterns
 #define PASSPHRASE_HEADER_SIZE 16
-#define PASSPHRASE_STRIDE (PASSPHRASE_HEADER_SIZE + MAX_PASSPHRASE_LEN)
+#define PASSPHRASE_STRIDE 256
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -584,18 +586,12 @@ void eth_address_from_pubkey(thread const uchar* pubkey_xy, thread uchar* addr) 
 // MODULAR ARITHMETIC (256-bit over secp256k1 prime)
 // ============================================================================
 
+// 128-bit multiplication using Metal intrinsics
+// mulhi() returns upper 64 bits, * returns lower 64 bits
+// This is correct, fast, and uses native GPU instructions
 inline void mul64(ulong a, ulong b, thread ulong& hi, thread ulong& lo) {
-    ulong a_lo = a & 0xFFFFFFFF, a_hi = a >> 32;
-    ulong b_lo = b & 0xFFFFFFFF, b_hi = b >> 32;
-    ulong p0 = a_lo * b_lo;
-    ulong p1 = a_lo * b_hi;
-    ulong p2 = a_hi * b_lo;
-    ulong p3 = a_hi * b_hi;
-    ulong mid = p1 + (p0 >> 32);
-    mid += p2;
-    if (mid < p2) p3 += 0x100000000UL;
-    lo = (p0 & 0xFFFFFFFF) | (mid << 32);
-    hi = p3 + (mid >> 32);
+    lo = a * b;           // Lower 64 bits (native multiply)
+    hi = mulhi(a, b);     // Upper 64 bits (Metal intrinsic)
 }
 
 inline ulong4 add_p(ulong4 a) {

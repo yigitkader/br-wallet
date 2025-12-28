@@ -34,7 +34,9 @@ const SHADER_SOURCE: &str = include_str!("brainwallet.metal");
 pub const OUTPUT_SIZE: usize = 152;
 
 pub const MAX_PASSPHRASE_LEN: usize = 128;
-pub const PASSPHRASE_STRIDE: usize = 16 + MAX_PASSPHRASE_LEN;
+// 256 bytes stride for optimal GPU memory coalescing (power of 2)
+// Layout: [1 byte length] [127 bytes passphrase] [128 bytes padding]
+pub const PASSPHRASE_STRIDE: usize = 256;
 
 /// Number of buffer sets for double-buffering
 const NUM_BUFFER_SETS: usize = 2;
