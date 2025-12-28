@@ -1,9 +1,4 @@
 //! GPU-accelerated brainwallet processing using Metal
-//!
-//! This module provides 10-100x speedup by:
-//! - Batch processing 65K+ passphrases per GPU dispatch
-//! - Parallel SHA256 + secp256k1 + RIPEMD160 on GPU
-//! - Zero-copy via unified memory (Apple Silicon)
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -23,58 +18,24 @@ const GPU_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// Metal shader source - embedded at compile time
 const SHADER_SOURCE: &str = include_str!("brainwallet.metal");
 
-/// Output size per passphrase: 152 bytes total (NO TAPROOT = 2x FASTER!)
-/// Primary (112 bytes): h160_c(20) + h160_u(20) + h160_nested(20) + eth_addr(20) + priv_key(32)
-/// GLV (40 bytes): glv_h160_c(20) + glv_eth_addr(20) - FREE 2x throughput via endomorphism!
-/// 
-/// NOTE: Taproot REMOVED - it required a second scalar_mul per passphrase,
-/// which doubled GPU workload. Removing it provides 2x speedup!
-/// 
-/// GLV Endomorphism gives us TWO keypairs from ONE EC computation:
-///   Primary: (k, P) where P = k*G
-///   GLV:     (λ*k mod n, φ(P)) where φ(P) = (β*x, y)
 pub const OUTPUT_SIZE: usize = 152;
 
-/// Maximum passphrase length
 pub const MAX_PASSPHRASE_LEN: usize = 128;
-
-/// Stride per passphrase in input buffer: 16 (aligned header) + MAX_PASSPHRASE_LEN = 144
-/// 
-/// Memory alignment optimization:
-/// - Old stride: 129 bytes (unaligned - causes GPU memory access slowdown)
-/// - New stride: 144 bytes (16-byte aligned for optimal GPU coalescing)
-/// - Header: [length:1][padding:15][data:128] = 144 bytes
-/// 
-/// GPU memory coalescing works best with 16/32/64 byte aligned accesses.
 pub const PASSPHRASE_STRIDE: usize = 16 + MAX_PASSPHRASE_LEN;
 
-/// Result from GPU processing for a single passphrase
-/// 
-/// NOTE: Taproot REMOVED for 2x GPU performance!
-/// 
-/// GLV Endomorphism bonus: From ONE EC computation, we get TWO valid keypairs!
-///   Primary: (k, P) where P = k*G
-///   GLV:     (λ*k mod n, φ(P)) where φ(P) = (β*x, y) - essentially FREE!
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct GpuBrainwalletResult {
-    // Primary keypair (112 bytes - NO TAPROOT!)
-    pub h160_c: [u8; 20],       // HASH160(compressed pubkey) - Bitcoin/Litecoin
-    pub h160_u: [u8; 20],       // HASH160(uncompressed pubkey) - Legacy addresses
-    pub h160_nested: [u8; 20],  // HASH160(P2SH-P2WPKH script) - Nested SegWit
-    pub eth_addr: [u8; 20],     // Keccak256(pubkey)[12:32] - Ethereum address
-    pub priv_key: [u8; 32],     // SHA256(passphrase) - private key
-    
-    // GLV endomorphism bonus (40 bytes) - FREE 2x throughput!
-    pub glv_h160_c: [u8; 20],   // HASH160(GLV compressed pubkey) - Bitcoin/Litecoin
-    pub glv_eth_addr: [u8; 20], // Keccak256(GLV pubkey)[12:32] - Ethereum address
+    pub h160_c: [u8; 20],
+    pub h160_u: [u8; 20],
+    pub h160_nested: [u8; 20],
+    pub eth_addr: [u8; 20],
+    pub priv_key: [u8; 32],
+    pub glv_h160_c: [u8; 20],
+    pub glv_eth_addr: [u8; 20],
 }
 
 impl GpuBrainwalletResult {
-    /// Parse from raw output bytes
-    /// Layout: Primary(112) + GLV(40) = 152 bytes (NO TAPROOT = 2x FASTER!)
-    ///   Primary: h160_c(20) + h160_u(20) + h160_nested(20) + eth_addr(20) + priv_key(32)
-    ///   GLV: glv_h160_c(20) + glv_eth_addr(20)
     #[inline]
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < OUTPUT_SIZE {
@@ -91,21 +52,17 @@ impl GpuBrainwalletResult {
             glv_eth_addr: [0u8; 20],
         };
         
-        // Primary keypair (112 bytes)
         result.h160_c.copy_from_slice(&data[0..20]);
         result.h160_u.copy_from_slice(&data[20..40]);
         result.h160_nested.copy_from_slice(&data[40..60]);
         result.eth_addr.copy_from_slice(&data[60..80]);
         result.priv_key.copy_from_slice(&data[80..112]);
-        
-        // GLV bonus (40 bytes)
         result.glv_h160_c.copy_from_slice(&data[112..132]);
         result.glv_eth_addr.copy_from_slice(&data[132..152]);
         
         Some(result)
     }
     
-    /// Check if result is valid (non-zero)
     #[inline]
     #[allow(dead_code)]
     pub fn is_valid(&self) -> bool {

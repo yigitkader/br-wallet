@@ -7,9 +7,7 @@
 // Supported Chains (ALL computed on GPU):
 // - Bitcoin: P2PKH (1...), P2SH-P2WPKH (3...), Native SegWit (bc1q...)
 // - Litecoin: Same address types with LTC prefixes
-// - Ethereum: Keccak256-based addresses (0x...) - FULL GPU COMPUTATION!
-//
-// NOTE: Taproot REMOVED for 2x performance (saves one scalar_mul per passphrase)
+// - Ethereum: Keccak256-based addresses (0x...)
 //
 // ═══════════════════════════════════════════════════════════════════════════
 // OPTIMIZATIONS IMPLEMENTED:
@@ -20,18 +18,10 @@
 // 3. secp256k1 fast reduction (p = 2^256 - K, K = 4294968273)
 // 4. Fermat's Little Theorem modular inversion (a^(p-2) mod p)
 // 5. Double-and-add scalar multiplication (MSB-first)
-// 6. Keccak256 on GPU for Ethereum (eliminates CPU bottleneck)
-// 7. NO TAPROOT = NO SECOND SCALAR_MUL = 2x FASTER!
+// 6. Keccak256 on GPU for Ethereum
+// 7. GLV Endomorphism - doubles throughput for free!
 //
-// 8. ⭐ GLV ENDOMORPHISM - FREE 2x THROUGHPUT! ⭐
-//    From ONE EC computation k*G, we get TWO valid keypairs:
-//      Primary: (k, P) where P = k*G
-//      GLV:     (λ*k mod n, φ(P)) where φ(P) = (β*x, y)
-//    This DOUBLES the number of addresses we check per batch!
-//
-// Output per passphrase: 152 bytes total
-//   Primary (112): h160_c + h160_u + h160_nested + eth_addr + priv_key
-//   GLV (40):      glv_h160_c + glv_eth_addr (FREE BONUS!)
+// Output: 152 bytes per passphrase
 // ============================================================================
 
 #include <metal_stdlib>
@@ -50,11 +40,6 @@ constant ulong4 SECP256K1_N = {
     0xBFD25E8CD0364141ULL, 0xBAAEDCE6AF48A03BULL,
     0xFFFFFFFFFFFFFFFEULL, 0xFFFFFFFFFFFFFFFFULL
 };
-
-// Note: SECP256K1_K = 4294968273 = 2^32 + 977 is defined later with other constants
-// P = 2^256 - K allows fast modular reduction: result = lo + hi * K (mod P)
-
-// NOTE: ge_curve_order and mod_n_reduce removed - were only used for Taproot
 
 constant ulong4 SECP256K1_GX = {
     0x59F2815B16F81798ULL, 0x029BFCDB2DCE28D9ULL,
@@ -1058,10 +1043,8 @@ void scalar_mul(ulong4 k,
 // TAPROOT (BIP341) - Tagged Hash for "TapTweak" (hardcoded)
 // ============================================================================
 
-// NOTE: TAPTWEAK_HASH and taptweak_hash removed - Taproot disabled for 2x performance
-
 // ============================================================================
-// MAIN KERNEL: process_brainwallet_batch
+// MAIN KERNEL
 // ============================================================================
 
 kernel void process_brainwallet_batch(
@@ -1142,11 +1125,7 @@ kernel void process_brainwallet_batch(
     uchar h160_nested[20];
     hash160_22(witness_script, h160_nested);
     
-    // NOTE: Step 9 (Taproot) REMOVED for 2x performance!
-    // Taproot required a second scalar_mul which doubled GPU workload.
-    // Removing it saves ~50% of GPU computation per passphrase.
-    
-    // Step 9: Ethereum address = Keccak256(pubkey_u without 0x04)[12:32]
+    // Step 9: Ethereum address
     // Computed entirely on GPU - no CPU post-processing needed!
     uchar eth_addr[20];
     eth_address_from_pubkey(pubkey_u + 1, eth_addr);  // Skip 0x04 prefix

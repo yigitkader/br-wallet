@@ -121,7 +121,7 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
     // Progress bar
     let estimated_lines = estimate_line_count(&mmap);
     println!("📊 Estimated lines: {}", estimated_lines);
-    
+
     let pb = ProgressBar::new(estimated_lines);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -166,8 +166,8 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
                     return None;
                 }
                 
-                let mut rep = String::new();
-                
+        let mut rep = String::new();
+
                 // Check Bitcoin - Primary keypair (zero-copy hash access)
                 // NOTE: Taproot removed for 2x GPU performance!
                 if comparer.btc_on {
@@ -184,8 +184,8 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
                         let result = raw.to_owned(passphrase);
                         let pass = String::from_utf8_lossy(passphrase);
                         rep.push_str(&format_btc_match(&result, &pass, true));
-                    }
-                }
+            }
+        }
 
                 // Check Litecoin - Primary keypair (zero-copy hash access)
                 // NOTE: Taproot removed for 2x GPU performance!
@@ -203,8 +203,8 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
                         let result = raw.to_owned(passphrase);
                         let pass = String::from_utf8_lossy(passphrase);
                         rep.push_str(&format_ltc_match(&result, &pass, true));
-                    }
-                }
+            }
+        }
 
                 // Check Ethereum - Primary keypair (zero-copy hash access)
                 if comparer.eth_on {
@@ -218,9 +218,9 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
                         let result = raw.to_owned(passphrase);
                         let pass = String::from_utf8_lossy(passphrase);
                         rep.push_str(&format_eth_match(&result, &pass, true));
-                    }
-                }
-                
+            }
+        }
+
                 if rep.is_empty() { None } else { Some(rep) }
             })
             .collect();
@@ -229,9 +229,9 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
         if !all_matches.is_empty() {
             let mut f = log.lock().unwrap();
             for rep in &all_matches {
-                let _ = f.write_all(rep.as_bytes());
-                pb.println(format!("\n{}", rep));
-            }
+            let _ = f.write_all(rep.as_bytes());
+            pb.println(format!("\n{}", rep));
+        }
             let _ = f.flush();
         }
 
