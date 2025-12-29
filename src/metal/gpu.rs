@@ -29,7 +29,15 @@ const GPU_TIMEOUT: Duration = Duration::from_secs(10);
 const GPU_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Metal shader source - embedded at compile time
-const SHADER_SOURCE: &str = include_str!("brainwallet.metal");
+/// Precomputed table is concatenated before main shader (replaces #include)
+const PRECOMPUTED_TABLE: &str = include_str!("precomputed_table.metal");
+const MAIN_SHADER: &str = include_str!("brainwallet.metal");
+
+lazy_static::lazy_static! {
+    /// Combined shader source: precomputed table + main shader
+    /// This replaces the #include directive which doesn't work at runtime
+    static ref SHADER_SOURCE: String = format!("{}\n{}", PRECOMPUTED_TABLE, MAIN_SHADER);
+}
 
 pub const OUTPUT_SIZE: usize = 152;
 
@@ -144,9 +152,9 @@ impl GpuBrainwallet {
         
         let tier = GpuTier::detect(&device)?;
         
-        // Compile shader
+        // Compile shader (precomputed table + main shader concatenated)
         let library = device
-            .new_library_with_source(SHADER_SOURCE, &metal::CompileOptions::new())
+            .new_library_with_source(&SHADER_SOURCE, &metal::CompileOptions::new())
             .map_err(|e| format!("Failed to compile shader: {}", e))?;
         
         let function = library
@@ -404,9 +412,9 @@ impl PipelinedGpuBrainwallet {
         
         let tier = GpuTier::detect(&device)?;
         
-        // Compile shader
+        // Compile shader (precomputed table + main shader concatenated)
         let library = device
-            .new_library_with_source(SHADER_SOURCE, &metal::CompileOptions::new())
+            .new_library_with_source(&SHADER_SOURCE, &metal::CompileOptions::new())
             .map_err(|e| format!("Failed to compile shader: {}", e))?;
         
         let function = library

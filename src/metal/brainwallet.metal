@@ -27,6 +27,9 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// NOTE: Precomputed table (PRECOMPUTED_GX/GY) is prepended by Rust at compile time
+// See gpu.rs for the concatenation logic
+
 // ============================================================================
 // SECP256K1 CONSTANTS
 // ============================================================================
@@ -1186,73 +1189,122 @@ inline uint get_window(ulong4 k, int w) {
     return window;
 }
 
+// ============================================================================
+// FIXED-BASE COMB SCALAR MULTIPLICATION (~5x faster!)
+// ============================================================================
+//
+// Uses precomputed table: PRECOMPUTED_GX/GY[window * 16 + idx]
+// TABLE[w][i] = i * 2^(4*w) * G  (affine coordinates)
+//
+// Algorithm: For 256-bit scalar k split into 64 4-bit windows:
+//   k = Σ(w_i * 2^(4*i)) for i = 0..63
+//   k*G = Σ(w_i * 2^(4*i) * G) = Σ(TABLE[i][w_i])
+//
+// Just 64 point additions! No doublings needed!
+// (Previous: 256 doubles + 64 adds = 320 ops)
+// (Now: 64 adds = 64 ops → ~5x speedup)
+// ============================================================================
+
+// Branchless lookup from precomputed constant table (affine points)
+inline void ct_precomputed_lookup(uint window, uint idx,
+                                   thread ulong4& X_out, thread ulong4& Y_out) {
+    // Direct index into constant array
+    uint base = window * PRECOMPUTED_ENTRIES;
+    
+    // Start with entry 0 (point at infinity marker: 0,0)
+    X_out = PRECOMPUTED_GX[base];
+    Y_out = PRECOMPUTED_GY[base];
+    
+    // Branchless selection through all 16 entries
+    #define SELECT_PRECOMPUTED(i) \
+        { \
+            bool4 mask = bool4(idx == i); \
+            X_out = select(X_out, PRECOMPUTED_GX[base + i], mask); \
+            Y_out = select(Y_out, PRECOMPUTED_GY[base + i], mask); \
+        }
+    
+    SELECT_PRECOMPUTED(1);  SELECT_PRECOMPUTED(2);  SELECT_PRECOMPUTED(3);
+    SELECT_PRECOMPUTED(4);  SELECT_PRECOMPUTED(5);  SELECT_PRECOMPUTED(6);
+    SELECT_PRECOMPUTED(7);  SELECT_PRECOMPUTED(8);  SELECT_PRECOMPUTED(9);
+    SELECT_PRECOMPUTED(10); SELECT_PRECOMPUTED(11); SELECT_PRECOMPUTED(12);
+    SELECT_PRECOMPUTED(13); SELECT_PRECOMPUTED(14); SELECT_PRECOMPUTED(15);
+    
+    #undef SELECT_PRECOMPUTED
+}
+
+// Extract 4-bit window from scalar (LSB-first for comb method)
+// Window 0 = bits 0-3, Window 63 = bits 252-255
+inline uint get_window_lsb(ulong4 k, int w) {
+    int bit_pos = w * 4;
+    int word_idx = bit_pos / 64;
+    int bit_offset = bit_pos % 64;
+    
+    ulong word = (word_idx == 0) ? k.x :
+                 (word_idx == 1) ? k.y :
+                 (word_idx == 2) ? k.z : k.w;
+    
+    uint window = (word >> bit_offset) & 0xF;
+    
+    // Handle window spanning two words
+    if (bit_offset > 60 && word_idx < 3) {
+        ulong next_word = (word_idx == 0) ? k.y :
+                          (word_idx == 1) ? k.z : k.w;
+        window |= ((uint)(next_word << (64 - bit_offset))) & 0xF;
+    }
+    
+    return window;
+}
+
 void scalar_mul(ulong4 k, 
                 thread ulong4& out_X, thread ulong4& out_Y,
                 thread ulong4& out_Z, thread ulong4& out_ZZ) {
     // ========================================================================
-    // Phase 1: Precompute table [0*G, 1*G, 2*G, ..., 15*G]
+    // FIXED-BASE COMB METHOD
     // ========================================================================
-    // Cost: 14 point additions (computed once per scalar multiplication)
-    
-    ulong4 table_X[16], table_Y[16], table_Z[16], table_ZZ[16];
-    
-    // table[0] = infinity (identity element)
-    table_X[0] = {0,0,0,0};
-    table_Y[0] = {1,0,0,0};
-    table_Z[0] = {0,0,0,0};
-    table_ZZ[0] = {0,0,0,0};
-    
-    // table[1] = G (generator point, in Jacobian form with Z=1)
-    table_X[1] = SECP256K1_GX;
-    table_Y[1] = SECP256K1_GY;
-    table_Z[1] = {1,0,0,0};
-    table_ZZ[1] = {1,0,0,0};
-    
-    // table[2] = 2*G (doubling)
-    ext_jac_dbl(table_X[1], table_Y[1], table_Z[1], table_ZZ[1],
-                table_X[2], table_Y[2], table_Z[2], table_ZZ[2]);
-    
-    // table[i] = table[i-1] + G for i = 3..15
-    for (int i = 3; i < 16; i++) {
-        ext_jac_add_affine(table_X[i-1], table_Y[i-1], table_Z[i-1], table_ZZ[i-1],
-                           SECP256K1_GX, SECP256K1_GY,
-                           table_X[i], table_Y[i], table_Z[i], table_ZZ[i]);
-    }
-    
+    // k*G = Σ TABLE[i][window_i]  for i = 0..63
+    // Each TABLE[i][w] = w * 2^(4*i) * G (precomputed affine points)
+    //
+    // Total: 64 point additions, ZERO doublings!
     // ========================================================================
-    // Phase 2: Windowed scalar multiplication (64 windows of 4 bits each)
-    // ========================================================================
-    // For each window: 4 doubles + 1 table lookup + 1 conditional add
-    // Total: 256 doubles + 64 adds (vs 256 doubles + 128 adds for double-and-add)
-    // Plus: ZERO warp divergence due to branchless operations
     
-    // Start with infinity
-    out_X = {0,0,0,0};
-    out_Y = {1,0,0,0};
-    out_Z = {0,0,0,0};
-    out_ZZ = {0,0,0,0};
+    // Start with point at infinity
+    out_X = {0, 0, 0, 0};
+    out_Y = {1, 0, 0, 0};  // Y=1 for infinity in our representation
+    out_Z = {0, 0, 0, 0};
+    out_ZZ = {0, 0, 0, 0};
     
-    // Process windows from MSB to LSB (w=0 is MSB window)
+    bool first_point = true;
+    
+    // Process all 64 windows
     for (int w = 0; w < 64; w++) {
-        // 4 doublings for this window
-        ext_jac_dbl(out_X, out_Y, out_Z, out_ZZ, out_X, out_Y, out_Z, out_ZZ);
-        ext_jac_dbl(out_X, out_Y, out_Z, out_ZZ, out_X, out_Y, out_Z, out_ZZ);
-        ext_jac_dbl(out_X, out_Y, out_Z, out_ZZ, out_X, out_Y, out_Z, out_ZZ);
-            ext_jac_dbl(out_X, out_Y, out_Z, out_ZZ, out_X, out_Y, out_Z, out_ZZ);
-            
         // Get 4-bit window value
-        uint window = get_window(k, w);
+        uint window_val = get_window_lsb(k, w);
         
-        // Branchless table lookup (no warp divergence!)
-        ulong4 pt_X, pt_Y, pt_Z, pt_ZZ;
-        ct_table_lookup_16(table_X, table_Y, table_Z, table_ZZ, window,
-                           pt_X, pt_Y, pt_Z, pt_ZZ);
+        // Skip if window is 0 (adding infinity = no change)
+        if (window_val == 0) continue;
         
-        // Add the point from table (handles window=0 case correctly as infinity)
-        ext_jac_add_jac(out_X, out_Y, out_Z, out_ZZ,
-                        pt_X, pt_Y, pt_Z, pt_ZZ,
-                                   out_X, out_Y, out_Z, out_ZZ);
+        // Lookup point from precomputed table (affine coordinates)
+        ulong4 pt_X, pt_Y;
+        ct_precomputed_lookup(w, window_val, pt_X, pt_Y);
+        
+        // Add to accumulator
+        if (first_point) {
+            // First non-zero point: just copy it (convert affine to Jacobian)
+            out_X = pt_X;
+            out_Y = pt_Y;
+            out_Z = {1, 0, 0, 0};
+            out_ZZ = {1, 0, 0, 0};
+            first_point = false;
+        } else {
+            // Add affine point to Jacobian accumulator
+            ext_jac_add_affine(out_X, out_Y, out_Z, out_ZZ,
+                               pt_X, pt_Y,
+                               out_X, out_Y, out_Z, out_ZZ);
+        }
     }
+    
+    // Handle edge case: k = 0 (should return infinity)
+    // Already handled by initialization
 }
 
 // ============================================================================
