@@ -24,11 +24,8 @@
 // Output: 152 bytes per passphrase
 // ============================================================================
 
-#include <metal_stdlib>
-using namespace metal;
-
-// NOTE: Precomputed table (PRECOMPUTED_GX/GY) is prepended by Rust at compile time
-// See gpu.rs for the concatenation logic
+// NOTE: #include <metal_stdlib> and using namespace metal; are in precomputed_table.metal
+// which is prepended by Rust at compile time (see gpu.rs)
 
 // ============================================================================
 // SECP256K1 CONSTANTS
@@ -1336,8 +1333,19 @@ kernel void process_brainwallet_batch(
     device const uchar* passphrases [[buffer(0)]],
     device const uint* passphrase_count [[buffer(1)]],
     device uchar* output [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]]
 ) {
+    // =========================================================================
+    // MONTGOMERY BATCH INVERSION - Shared Memory
+    // =========================================================================
+    // 256 threads share these arrays to batch mod_inv calls
+    // Result: 256 mod_inv calls → 1 mod_inv + ~512 mod_mul
+    // =========================================================================
+    threadgroup ulong4 shared_Z[THREADGROUP_SIZE];
+    threadgroup ulong4 shared_Z_inv[THREADGROUP_SIZE];
+    threadgroup bool shared_valid[THREADGROUP_SIZE];
+    
     uint count = *passphrase_count;
     bool is_valid = (gid < count);
     
@@ -1368,7 +1376,7 @@ kernel void process_brainwallet_batch(
     // Step 3: k*G → Public Key (Extended Jacobian)
     ulong4 X = {0, 0, 0, 0};
     ulong4 Y = {1, 0, 0, 0};  // Point at infinity has Y=1
-    ulong4 Z = {1, 0, 0, 0};  // Default Z=1 for invalid threads (doesn't affect batch)
+    ulong4 Z = {1, 0, 0, 0};  // Default Z=1 for invalid threads
     ulong4 ZZ = {1, 0, 0, 0};
     
     if (key_valid) {
@@ -1376,13 +1384,72 @@ kernel void process_brainwallet_batch(
     }
     
     // =========================================================================
-    // SIMPLE INVERSION (Montgomery disabled for debugging)
+    // MONTGOMERY BATCH INVERSION - Phase 1: Store Z values
     // =========================================================================
-    // Each thread computes its own mod_inv - no batch optimization
-    // This is slower but more reliable for debugging
-    // =========================================================================
+    // All threads must participate in barriers - no early return!
+    // Invalid threads contribute Z=1 which doesn't affect the product
+    shared_Z[lid] = Z;
+    shared_valid[lid] = key_valid && !IsZero(Z);
     
-    // Handle invalid threads - zero output
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // =========================================================================
+    // MONTGOMERY BATCH INVERSION - Phase 2: Thread 0 computes all inverses
+    // =========================================================================
+    // Algorithm: inv(Z0), inv(Z1), ... inv(Zn) using single mod_inv
+    //   products[i] = Z0 * Z1 * ... * Zi
+    //   inv_all = mod_inv(products[n-1])
+    //   inv[n-1] = inv_all * products[n-2]
+    //   inv[i] = inv_all * products[i-1], then inv_all *= Z[i]
+    // =========================================================================
+    if (lid == 0) {
+        // Build cumulative products
+        ulong4 products[THREADGROUP_SIZE];
+        int valid_indices[THREADGROUP_SIZE];
+        int valid_count = 0;
+        
+        for (int i = 0; i < THREADGROUP_SIZE; i++) {
+            if (shared_valid[i]) {
+                if (valid_count == 0) {
+                    products[0] = shared_Z[i];
+                } else {
+                    products[valid_count] = mod_mul(products[valid_count - 1], shared_Z[i]);
+                }
+                valid_indices[valid_count] = i;
+                valid_count++;
+            }
+        }
+        
+        if (valid_count > 0) {
+            // Single mod_inv for all Z values!
+            ulong4 inv = mod_inv(products[valid_count - 1]);
+            
+            // Backpropagate to get individual inverses
+            for (int i = valid_count - 1; i > 0; i--) {
+                int idx = valid_indices[i];
+                shared_Z_inv[idx] = mod_mul(inv, products[i - 1]);
+                inv = mod_mul(inv, shared_Z[idx]);
+            }
+            // First valid element gets the final inverse
+            shared_Z_inv[valid_indices[0]] = inv;
+        }
+        
+        // Set Z_inv = 1 for invalid threads
+        for (int i = 0; i < THREADGROUP_SIZE; i++) {
+            if (!shared_valid[i]) {
+                shared_Z_inv[i] = ulong4{1, 0, 0, 0};
+            }
+        }
+    }
+    
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // =========================================================================
+    // Phase 3: Each thread reads its Z_inv and continues
+    // =========================================================================
+    ulong4 Z_inv = shared_Z_inv[lid];
+    
+    // Handle invalid threads - zero output (AFTER all barriers!)
     if (!key_valid) {
         if (is_valid) {
             for (int i = 0; i < OUTPUT_SIZE; i++) {
@@ -1393,8 +1460,6 @@ kernel void process_brainwallet_batch(
     }
     
     // Convert to affine: x = X/Z², y = Y/Z³
-    // Each thread computes its own inversion (no batch)
-    ulong4 Z_inv = mod_inv(Z);
     ulong4 Z_inv2 = mod_sqr(Z_inv);
     ulong4 Z_inv3 = mod_mul(Z_inv2, Z_inv);
     ulong4 ax = mod_mul(X, Z_inv2);

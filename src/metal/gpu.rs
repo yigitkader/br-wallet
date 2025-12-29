@@ -280,8 +280,11 @@ impl GpuBrainwallet {
         encoder.set_buffer(1, Some(&self.count_buffer), 0);
         encoder.set_buffer(2, Some(&self.output_buffer), 0);
         
-        let grid_size = MTLSize::new(count as u64, 1, 1);
-        let threadgroup_size = MTLSize::new(self.tier.threadgroup_size as u64, 1, 1);
+        // Round up grid size to multiple of threadgroup size for Montgomery batch inversion
+        // All threads in a threadgroup must reach barriers together
+        let tg_size = self.tier.threadgroup_size as u64;
+        let grid_size = MTLSize::new(((count as u64 + tg_size - 1) / tg_size) * tg_size, 1, 1);
+        let threadgroup_size = MTLSize::new(tg_size, 1, 1);
         
         encoder.dispatch_threads(grid_size, threadgroup_size);
         encoder.end_encoding();
@@ -541,8 +544,10 @@ impl PipelinedGpuBrainwallet {
         encoder.set_buffer(1, Some(&buffer.count), 0);
         encoder.set_buffer(2, Some(&buffer.output), 0);
         
-        let grid_size = MTLSize::new(count as u64, 1, 1);
-        let threadgroup_size = MTLSize::new(self.tier.threadgroup_size as u64, 1, 1);
+        // Round up grid size to multiple of threadgroup size for Montgomery batch inversion
+        let tg_size = self.tier.threadgroup_size as u64;
+        let grid_size = MTLSize::new(((count as u64 + tg_size - 1) / tg_size) * tg_size, 1, 1);
+        let threadgroup_size = MTLSize::new(tg_size, 1, 1);
         
         encoder.dispatch_threads(grid_size, threadgroup_size);
         encoder.end_encoding();
