@@ -640,36 +640,56 @@ inline ulong4 mod_sub(ulong4 a, ulong4 b) {
     return r;
 }
 
+// secp256k1 fast reduction: P = 2^256 - K, K = 4294968273
+// For 512-bit product [r0..r3 : r4..r7], compute (r0..r3) + (r4..r7) * K mod P
+//
+// CARRY BUG FIX: All additions that can overflow must track carry properly.
+// Previous bug: s3 += hi + c could overflow without being tracked.
 inline ulong4 secp256k1_reduce(ulong r0, ulong r1, ulong r2, ulong r3,
                                ulong r4, ulong r5, ulong r6, ulong r7) {
-    ulong s0 = r0, s1 = r1, s2 = r2, s3 = r3, c = 0, hi, lo, old;
+    ulong s0 = r0, s1 = r1, s2 = r2, s3 = r3;
+    ulong c = 0, hi, lo, old;
+    ulong total_overflow = 0;  // Track overflow beyond 256 bits
 
+    // r4 * K
     mul64(r4, SECP256K1_K, hi, lo);
     old = s0; s0 += lo; c = (s0 < old) ? 1 : 0;
     old = s1; s1 += hi + c; c = (s1 < old || (c && s1 == old + hi)) ? 1 : 0;
-    s2 += c; c = (s2 < c) ? 1 : 0; s3 += c;
+    old = s2; s2 += c; c = (s2 < old) ? 1 : 0;
+    old = s3; s3 += c; if (s3 < old) total_overflow++;
 
+    // r5 * K
     mul64(r5, SECP256K1_K, hi, lo);
     old = s1; s1 += lo; c = (s1 < old) ? 1 : 0;
     old = s2; s2 += hi + c; c = (s2 < old || (c && s2 == old + hi)) ? 1 : 0;
-    s3 += c;
+    old = s3; s3 += c; if (s3 < old) total_overflow++;
 
+    // r6 * K
     mul64(r6, SECP256K1_K, hi, lo);
     old = s2; s2 += lo; c = (s2 < old) ? 1 : 0;
-    s3 += hi + c;
+    // FIX: s3 += hi + c can overflow, must track it
+    ulong add_val = hi + c;
+    old = s3; s3 += add_val;
+    if (s3 < old || (c && add_val < hi)) total_overflow++;
 
+    // r7 * K
     mul64(r7, SECP256K1_K, hi, lo);
     old = s3; s3 += lo;
-    ulong overflow = hi + ((s3 < old) ? 1 : 0);
+    ulong overflow = hi + ((s3 < old) ? 1 : 0) + total_overflow;
 
-    if (overflow > 0) {
+    // Reduce overflow (iterate until no more overflow)
+    while (overflow > 0) {
         mul64(overflow, SECP256K1_K, hi, lo);
         old = s0; s0 += lo; c = (s0 < old) ? 1 : 0;
-        old = s1; s1 += hi + c; c = (s1 < old) ? 1 : 0;
-        s2 += c; c = (s2 < c) ? 1 : 0; s3 += c;
+        old = s1; s1 += hi + c; c = (s1 < old || (c && s1 == old + hi)) ? 1 : 0;
+        old = s2; s2 += c; c = (s2 < old) ? 1 : 0;
+        old = s3; s3 += c;
+        overflow = (s3 < old) ? 1 : 0;
     }
 
     ulong4 res = {s0, s1, s2, s3};
+    
+    // Final reduction: if result >= P, subtract P
     bool need = s3 > SECP256K1_P.w || (s3 == SECP256K1_P.w && (s2 > SECP256K1_P.z ||
         (s2 == SECP256K1_P.z && (s1 > SECP256K1_P.y || (s1 == SECP256K1_P.y && s0 >= SECP256K1_P.x)))));
     if (need) res = mod_sub(res, SECP256K1_P);
@@ -1264,17 +1284,8 @@ kernel void process_brainwallet_batch(
     device const uchar* passphrases [[buffer(0)]],
     device const uint* passphrase_count [[buffer(1)]],
     device uchar* output [[buffer(2)]],
-    uint gid [[thread_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint tg_idx [[threadgroup_position_in_grid]]
+    uint gid [[thread_position_in_grid]]
 ) {
-    // Threadgroup shared memory for Montgomery Batch Inversion
-    // Each thread stores its Z value, thread 0 computes all inverses
-    threadgroup ulong4 shared_Z[THREADGROUP_SIZE];
-    threadgroup ulong4 shared_Z_inv[THREADGROUP_SIZE];
-    threadgroup ulong4 shared_products[THREADGROUP_SIZE];
-    threadgroup bool shared_valid[THREADGROUP_SIZE];  // Track valid threads
-    
     uint count = *passphrase_count;
     bool is_valid = (gid < count);
     
@@ -1313,67 +1324,10 @@ kernel void process_brainwallet_batch(
     }
     
     // =========================================================================
-    // MONTGOMERY BATCH INVERSION - Phase 1: Store Z values
+    // SIMPLE INVERSION (Montgomery disabled for debugging)
     // =========================================================================
-    shared_Z[lid] = Z;
-    shared_valid[lid] = key_valid && !IsZero(Z);
-    
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    // =========================================================================
-    // MONTGOMERY BATCH INVERSION - Phase 2: Thread 0 computes all inverses
-    // =========================================================================
-    // 
-    // Algorithm (O(n) multiplies + 1 inversion):
-    //   products[0] = Z[0]
-    //   products[i] = products[i-1] * Z[i]
-    //   inv = mod_inv(products[n-1])
-    //   for i = n-1 down to 1:
-    //     Z_inv[i] = inv * products[i-1]
-    //     inv = inv * Z[i]
-    //   Z_inv[0] = inv
-    //
-    // For invalid threads: Z=1, so Z_inv=1 (neutral element)
-    // =========================================================================
-    
-    if (lid == 0) {
-        // Build cumulative products
-        int valid_count = 0;
-        int valid_indices[THREADGROUP_SIZE];
-        
-        for (int i = 0; i < THREADGROUP_SIZE; i++) {
-            if (shared_valid[i]) {
-                if (valid_count == 0) {
-                    shared_products[valid_count] = shared_Z[i];
-                } else {
-                    shared_products[valid_count] = mod_mul(shared_products[valid_count - 1], shared_Z[i]);
-                }
-                valid_indices[valid_count] = i;
-                valid_count++;
-            } else {
-                // Invalid threads get Z_inv = 1 (identity for multiplication)
-                shared_Z_inv[i] = ulong4{1, 0, 0, 0};
-            }
-        }
-        
-        if (valid_count > 0) {
-            // Single mod_inv call for entire threadgroup!
-            ulong4 inv = mod_inv(shared_products[valid_count - 1]);
-            
-            // Backpropagate to compute individual inverses
-            for (int i = valid_count - 1; i > 0; i--) {
-                int idx = valid_indices[i];
-                shared_Z_inv[idx] = mod_mul(inv, shared_products[i - 1]);
-                inv = mod_mul(inv, shared_Z[idx]);
-            }
-            shared_Z_inv[valid_indices[0]] = inv;
-        }
-    }
-    
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    // =========================================================================
-    // Phase 3: Each thread reads its Z_inv and continues
+    // Each thread computes its own mod_inv - no batch optimization
+    // This is slower but more reliable for debugging
     // =========================================================================
     
     // Handle invalid threads - zero output
@@ -1387,7 +1341,8 @@ kernel void process_brainwallet_batch(
     }
     
     // Convert to affine: x = X/Z², y = Y/Z³
-    ulong4 Z_inv = shared_Z_inv[lid];
+    // Each thread computes its own inversion (no batch)
+    ulong4 Z_inv = mod_inv(Z);
     ulong4 Z_inv2 = mod_sqr(Z_inv);
     ulong4 Z_inv3 = mod_mul(Z_inv2, Z_inv);
     ulong4 ax = mod_mul(X, Z_inv2);
@@ -1433,13 +1388,14 @@ kernel void process_brainwallet_batch(
     // From the same EC computation, we get a second valid keypair:
     //   φ(P) = (β·x, y) corresponds to private key λ·k mod n
     //
-    // This is essentially FREE:
-    //   - One mod_mul for glv_x (already done in EC computation time)
-    //   - glv_y is the same as ay
-    //   - GLV private key = λ·k mod n (computed on CPU only if there's a match)
-    
-    ulong4 glv_x, glv_y;
-    glv_endomorphism(ax, ay, glv_x, glv_y);
+    // GLV endomorphism on secp256k1:
+    //   - Curve has special property: β³ ≡ 1 (mod p)
+    //   - For point P=(x,y), φ(P) = (β·x mod p, y) is also on the curve
+    //   - The corresponding private key is λ·k mod n
+    //
+    // DIRECT COMPUTATION (no inline call to avoid potential compiler issues)
+    ulong4 glv_x = mod_mul(ax, GLV_BETA);  // β·x mod p
+    ulong4 glv_y = ay;                      // y stays the same
     
     // GLV compressed pubkey
     uchar glv_pubkey_c[33];
