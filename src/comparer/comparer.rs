@@ -226,11 +226,13 @@ impl Comparer {
                         if let Ok((_, _, p)) = bech32::segwit::decode(a) {
                             if let Ok(arr) = <[u8; 20]>::try_from(p.as_slice()) {
                                 h20.insert(arr);
-                            } else if let Ok(arr) = <[u8; 32]>::try_from(p.as_slice()) {
+                            }
+                            if let Ok(arr) = <[u8; 32]>::try_from(p.as_slice()) {
                                 h32.insert(arr);
                             }
                         }
-                    } else if let Ok(d) = bs58::decode(a).with_check(None).into_vec() {
+                    }
+                    if let Ok(d) = bs58::decode(a).with_check(None).into_vec() {
                         if d.len() >= 21 {
                             if let Ok(arr) = <[u8; 20]>::try_from(&d[1..21]) {
                                 h20.insert(arr);
@@ -244,11 +246,13 @@ impl Comparer {
                         if let Ok((_, _, p)) = bech32::segwit::decode(a) {
                             if let Ok(arr) = <[u8; 20]>::try_from(p.as_slice()) {
                                 h20.insert(arr);
-                            } else if let Ok(arr) = <[u8; 32]>::try_from(p.as_slice()) {
+                            }
+                            if let Ok(arr) = <[u8; 32]>::try_from(p.as_slice()) {
                                 h32.insert(arr);
                             }
                         }
-                    } else if let Ok(d) = bs58::decode(a).with_check(None).into_vec() {
+                    }
+                    if let Ok(d) = bs58::decode(a).with_check(None).into_vec() {
                         if d.len() >= 21 {
                             if let Ok(arr) = <[u8; 20]>::try_from(&d[1..21]) {
                                 h20.insert(arr);
