@@ -36,10 +36,11 @@ pub struct BrainwalletResult {
 }
 
 impl BrainwalletResult {
-    /// Check if result is valid (non-zero hash)
+    /// Check if result is valid (non-zero private key)
+    /// Private key is NEVER zero for valid passphrases (SHA256 output)
     #[inline]
     pub fn is_valid(&self) -> bool {
-        self.h160_c.iter().any(|&b| b != 0)
+        self.priv_key.iter().any(|&b| b != 0)
     }
     
     /// Get passphrase as UTF-8 string (lossy conversion)
@@ -66,9 +67,15 @@ impl<'a> RawGpuResult<'a> {
         }
     }
     
+    /// Check if this result contains valid data
+    /// We check the private key (bytes 80-112) instead of h160 because:
+    /// - A valid private key is NEVER all zeros (GPU sets it from SHA256)
+    /// - h160 could theoretically be all zeros (astronomically unlikely but possible)
+    /// - This ensures we don't miss Ethereum-only matches
     #[inline]
     pub fn is_valid(&self) -> bool {
-        self.data[..20].iter().any(|&b| b != 0)
+        // Private key is at bytes 80-112, check if non-zero
+        self.data[80..112].iter().any(|&b| b != 0)
     }
     
     #[inline]
@@ -341,9 +348,10 @@ impl<'a> PassphraseBatcher<'a> {
                 line = &line[..line.len() - 1];
             }
             
-            if !line.is_empty() {
-                batch.push(line);
-            }
+            // Include empty strings - they are valid brainwallets!
+            // SHA256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+            // This generates real Bitcoin address: 1HZwkjkeaoZfTSaJxDw6aKkxp45agDiEzNG
+            batch.push(line);
             
             self.position = end + 1;
         }
