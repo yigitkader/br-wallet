@@ -268,14 +268,18 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
                 })
                 .collect();
 
-            // Write matches - IMMEDIATE FLUSH after each match to prevent data loss
+            // Write matches - IMMEDIATE FLUSH + SYNC after each match to prevent data loss
             // If program crashes, we don't want to lose found matches
+            // CRITICAL: flush() only clears buffer, sync_all() guarantees disk write
             if !all_matches.is_empty() {
                 let mut f = log.lock().unwrap();
                 for rep in &all_matches {
                     let _ = f.write_all(rep.as_bytes());
-                    // Flush immediately after each match - critical for data safety
+                    // Flush buffer to OS
                     let _ = f.flush();
+                    // CRITICAL: Force disk write to prevent data loss on crash
+                    // sync_all() ensures data is physically written to disk
+                    let _ = f.get_mut().sync_all();
                     pb.println(format!("\n{}", rep));
                 }
             }
@@ -305,6 +309,8 @@ pub fn start_cracking(dict: &str, comparer: &Comparer) {
 
     if let Ok(mut f) = log.lock() {
         let _ = f.flush();
+        // Final sync to ensure all data is written to disk
+        let _ = f.get_mut().sync_all();
     }
 
     let processed = processor.total_processed();
